@@ -512,6 +512,8 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    #[cfg(feature = "diagnostics")]
+    LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -538,6 +540,8 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
+    #[cfg(feature = "diagnostics")]
+    LAST.set(Some((name.to_owned(), false)));
     let pso = {
         let _call = call("make", name);
         create()?
@@ -559,6 +563,14 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// This thread's last pipeline: its name, and whether it was loaded
+    /// (else made), for the pipeline log (diagnostics).
+    pub(crate) static LAST: std::cell::Cell<Option<(String, bool)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -691,6 +703,12 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
         *used = Some(set);
     }
     used
+}
+
+/// Reads the early list now if not yet, so a save keeps it (a pre-build
+/// requests no title pipeline, and a save writes the list as held).
+pub(crate) fn keep_early_list() {
+    drop(used());
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
