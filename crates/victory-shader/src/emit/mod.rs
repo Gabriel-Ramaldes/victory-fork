@@ -188,6 +188,39 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// What a translation depends on besides its container and the
+/// translator's code, as bytes for a cache key: the settings above (loop
+/// limit, group barriers, clean-up passes), the environment switches that
+/// change the code made, and what the host has told the translator (its
+/// widest wave, [`set_host_max_wave`]; its view heap's null slot,
+/// [`set_view_heap_limit`]). Read it after those are set: a cache keyed
+/// before reads the translations of another host.
+pub fn settings() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.push(group_sync());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    for name in [
+        "VICTORY_WAVE_WIDE",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_WAVE_LOCAL",
+        "VICTORY_F16_NEAREST",
+        "VICTORY_STRICT_JOINS",
+        "VICTORY_MESH_OUTPUT_STRICT",
+    ] {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    out
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {

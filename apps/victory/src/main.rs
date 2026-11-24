@@ -90,6 +90,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Only translate into the shader cache `run` reads (the warm-up):
+        /// every container found, once, nothing else checked or listed.
+        #[arg(long, conflicts_with_all = ["validate", "pipelines", "list"])]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -155,10 +159,17 @@ fn main() -> Result<()> {
         } => shader::run(paths, verbose || disasm, disasm, effects),
         Command::Translate {
             paths,
+            jobs,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs),
+        Command::Translate {
+            paths,
             validate,
             pipelines,
             list,
             jobs,
+            cache: false,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
