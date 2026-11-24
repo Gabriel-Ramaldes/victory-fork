@@ -70,6 +70,8 @@ mod twin;
 #[cfg(windows)]
 mod texpool;
 #[cfg(windows)]
+mod tdr;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
