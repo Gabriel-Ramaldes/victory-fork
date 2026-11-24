@@ -15,7 +15,11 @@
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
 //!   result (a descriptor handle made again in each block, an index clamped
-//!   again, a register read as a float again).
+//!   again, a register read as a float again). A handle is one with its
+//!   annotation: two handles of one heap slot annotated as different kinds
+//!   of resource stay two, each with an index value of its own, and a
+//!   resource size is reused within its block only (both for AMD's DXIL
+//!   compiler, see [`effect`] and `merge`).
 //! - [`FACTS`]: in the blocks only one side of a branch leads to, the
 //!   branch's condition is that side's constant, and so is what the
 //!   condition was made of (both terms of an `and` that held, the opposite
@@ -180,11 +184,11 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Effect {
     /// Nothing, and the result depends on the arguments alone for the whole
-    /// run of the shader (arithmetic, handles, inputs, constant buffers,
-    /// resource sizes).
+    /// run of the shader (arithmetic, handles, inputs, constant buffers).
     Pure,
     /// Nothing, but the result depends on memory a store may change
-    /// (buffer and texture reads).
+    /// (buffer and texture reads), or is kept to its block for a host
+    /// compiler's sake (resource sizes, see [`effect`]).
     Reads,
     /// Nothing, but the result depends on which lanes run the instruction
     /// (wave and quad operations).
@@ -197,12 +201,14 @@ pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
-        // A shader cannot write a constant buffer or resize a resource.
-        Some(Attr::ReadOnly)
-            if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
-        {
-            Effect::Pure
-        }
+        // A shader cannot write a constant buffer.
+        Some(Attr::ReadOnly) if name.starts_with("cbufferLoadLegacy") => Effect::Pure,
+        // Nor resize a resource, but a size used in blocks below the one
+        // that read it crashes AMD's DXIL compiler (amdxc64.dll, driver
+        // 32.0.32029, RX 9070 XT: a null read while it makes the pipeline;
+        // the module validates). As a read, a size is reused within its
+        // block only.
+        Some(Attr::ReadOnly) if name.starts_with("getDimensions") => Effect::Reads,
         Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
         // Declared with the attribute of calls that have effects, and have
@@ -633,6 +639,65 @@ impl Module {
         }
     }
 
+    /// Per handle that `dx.op.annotateHandle` annotates, its properties
+    /// operand; for a handle annotated two ways, the handle itself (a value
+    /// no other handle's key holds).
+    fn annotations(&self) -> HashMap<u32, V> {
+        let mut out: HashMap<u32, V> = HashMap::new();
+        for blk in &self.blocks {
+            for &i in &blk.body {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+                    continue;
+                }
+                let (Some(&V::Inst(h)), Some(&props)) = (args.get(1), args.get(2)) else {
+                    continue;
+                };
+                out.entry(h)
+                    .and_modify(|p| {
+                        if *p != props {
+                            *p = V::Inst(h);
+                        }
+                    })
+                    .or_insert(props);
+            }
+        }
+        out
+    }
+
+    /// Per index operand of `dx.op.createHandleFromHeap` and
+    /// `dx.op.createHandleFromBinding`, the annotation of the handle made
+    /// from it (see [`Module::annotations`]); an index two handles annotated
+    /// differently are made from has the annotation of neither.
+    fn index_kinds(&self, annotations: &HashMap<u32, V>) -> HashMap<V, V> {
+        let mut out: HashMap<V, V> = HashMap::new();
+        for blk in &self.blocks {
+            for &i in &blk.body {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                let at = match self.funcs[*f as usize].name.as_str() {
+                    "dx.op.createHandleFromHeap" => 1,
+                    "dx.op.createHandleFromBinding" => 2,
+                    _ => continue,
+                };
+                let (Some(&index), Some(&props)) = (args.get(at), annotations.get(&i)) else {
+                    continue;
+                };
+                out.entry(index)
+                    .and_modify(|p| {
+                        if *p != props {
+                            *p = V::Inst(i);
+                        }
+                    })
+                    .or_insert(props);
+            }
+        }
+        out
+    }
+
     fn key(&self, i: u32) -> Option<Key> {
         let inst = &self.insts[i as usize];
         Some(match &inst.op {
@@ -706,16 +771,34 @@ impl Module {
                 }
             }
         }
+        // Per handle, the resource properties it is annotated with, part of
+        // the handle's key. The lowering annotates each handle it makes
+        // once; one heap slot can be read as two kinds of resource (a
+        // structured buffer's element count, then its bytes), and merged,
+        // two such handles would be one handle with two annotations (with a
+        // constant index nothing else keeps them apart).
+        let annotations = if passes & REUSE != 0 {
+            self.annotations()
+        } else {
+            HashMap::new()
+        };
+        // Per value a handle is made from (its heap slot or binding index),
+        // that handle's annotation, part of the value's key: handles of one
+        // slot annotated differently whose index is one value crash AMD's
+        // DXIL compiler (amdxc64.dll, driver 32.0.32029, RX 9070 XT: a null
+        // read while it makes the pipeline; the module validates). Handles
+        // annotated alike still share their index.
+        let index_kinds = self.index_kinds(&annotations);
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
-        let mut known: HashMap<Key, V> = HashMap::new();
+        let mut known: HashMap<(Key, Option<V>), V> = HashMap::new();
         // The reads of the block being walked since its last store.
         let mut read: HashMap<Key, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
             Enter(usize),
-            Leave(Vec<Key>, Learned),
+            Leave(Vec<(Key, Option<V>)>, Learned),
         }
         let mut steps = vec![Step::Enter(0)];
         while let Some(step) = steps.pop() {
@@ -770,6 +853,10 @@ impl Module {
                     // The type too: an undefined value of one type is not
                     // that of another.
                     key.push((ty.0 as usize, V::Global(u32::MAX)));
+                    // And the handle a join is the index of, as below.
+                    if let Some(&kind) = index_kinds.get(&V::Inst(p)) {
+                        key.push((usize::MAX, kind));
+                    }
                     match joins.get(&key) {
                         Some(&first) => {
                             repl[p as usize] = Some(first);
@@ -807,8 +894,14 @@ impl Module {
                 let class = self.class(&effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
-                    && let Some(key) = self.key(i)
+                    && let Some(mut key) = self.key(i)
                 {
+                    if let Key::Call(_, args) = &mut key
+                        && let Some(&props) = annotations.get(&i)
+                    {
+                        args.push(props);
+                    }
+                    let key = (key, index_kinds.get(&V::Inst(i)).copied());
                     if let Some(&first) = known.get(&key) {
                         repl[i as usize] = Some(first);
                         changed = true;
@@ -1621,6 +1714,132 @@ mod tests {
         let stores = stores(&m, join);
         assert_eq!(stores[0], [x, p]);
         assert_eq!(stores[1][1], p);
+        m.write();
+    }
+
+    /// AMD's compiler crashes on a resource size used in blocks below the
+    /// one that read it (see `effect`): a size is read again there, and
+    /// only reused within its own block.
+    #[test]
+    fn a_resource_size_is_reused_within_its_block_only() {
+        let Diamond {
+            k: Kit {
+                mut m, b, writes, ..
+            },
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+        let one = m.i32(1);
+        let top = m.call(b, dims, vec![one, one]);
+        let again = m.call(b, dims, vec![one, one]);
+        m.call(b, writes, vec![top, again]);
+        let below = m.call(then, dims, vec![one, one]);
+        m.call(then, writes, vec![below, below]);
+        m.optimise(ALL);
+        assert_eq!(stores(&m, b)[0], [top, top], "one size for its block");
+        assert_eq!(stores(&m, then)[0], [below, below], "read again below it");
+        m.write();
+    }
+
+    /// One heap slot read as two kinds of resource keeps two handles (one
+    /// handle annotated two ways crashes AMD's compiler); handles of one
+    /// slot annotated alike are one.
+    #[test]
+    fn a_handle_is_reused_only_with_its_annotation() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            fty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let annotate = m.function("dx.op.annotateHandle", fty, Some(Attr::ReadNone), false);
+        let (op, slot, flags) = (m.i32(218), m.i32(7), m.i32(0));
+        let (structured, raw) = (m.i32(12), m.i32(11));
+        let h1 = m.call(b, heap, vec![op, slot, flags]);
+        let a1 = m.call(b, annotate, vec![op, h1, structured]);
+        let h2 = m.call(b, heap, vec![op, slot, flags]);
+        let a2 = m.call(b, annotate, vec![op, h2, raw]);
+        let h3 = m.call(b, heap, vec![op, slot, flags]);
+        let a3 = m.call(b, annotate, vec![op, h3, raw]);
+        m.call(b, writes, vec![a1, a2]);
+        m.call(b, writes, vec![a3, a3]);
+        m.terminate(b, Term::Ret);
+        m.optimise(ALL);
+        let stores = stores(&m, b);
+        assert_eq!(stores[0], [a1, a2], "a slot read as two kinds: two handles");
+        assert_eq!(stores[1], [a2, a2], "annotated alike: the earlier handle");
+        let annotated: Vec<V> = m.blocks[b]
+            .body
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, args) if m.funcs[*f as usize].name == "dx.op.annotateHandle" => {
+                    Some(args[1])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(annotated, [h1, h2], "each handle annotated once");
+        m.write();
+    }
+
+    /// Handles annotated differently keep indices of their own, however
+    /// alike they are computed (one index value for both crashes AMD's
+    /// compiler); a handle annotated like an earlier one shares it.
+    #[test]
+    fn handles_annotated_differently_keep_their_own_index() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            fty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let annotate = m.function("dx.op.annotateHandle", fty, Some(Attr::ReadNone), false);
+        let (op, one, three, flags) = (m.i32(218), m.i32(1), m.i32(3), m.i32(0));
+        let (structured, raw) = (m.i32(12), m.i32(11));
+        let base = m.call(b, reads, vec![one, one]);
+        let handle = |m: &mut Module, props| {
+            let index = m.bin(b, Bin::Add, base, three);
+            let h = m.call(b, heap, vec![op, index, flags]);
+            (index, m.call(b, annotate, vec![op, h, props]))
+        };
+        let (i1, a1) = handle(&mut m, structured);
+        let (i2, a2) = handle(&mut m, raw);
+        let (_, a3) = handle(&mut m, raw);
+        m.call(b, writes, vec![a1, a2]);
+        m.call(b, writes, vec![a3, a3]);
+        m.terminate(b, Term::Ret);
+        m.optimise(ALL);
+        let indices: Vec<V> = m.blocks[b]
+            .body
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, args) if m.funcs[*f as usize].name == "dx.op.createHandleFromHeap" => {
+                    Some(args[1])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, [i1, i2], "two handles, each with its own index");
+        let stores = stores(&m, b);
+        assert_eq!(stores[0], [a1, a2]);
+        assert_eq!(stores[1], [a2, a2], "annotated alike: the earlier handle");
         m.write();
     }
 
