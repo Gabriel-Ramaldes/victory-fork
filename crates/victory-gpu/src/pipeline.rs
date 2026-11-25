@@ -536,6 +536,7 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
+    crate::capture::note_drop(&why);
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
@@ -803,6 +804,12 @@ pub(crate) fn library_removal_note() -> String {
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub use library::{COMPILER_CRASHES_FILE, parse_compiler_crashes};
+
+/// Pipelines queued and not made yet (the capture timeline).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn queued() -> u64 {
+    make::waiting()
+}
 
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
