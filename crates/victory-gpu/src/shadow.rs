@@ -1777,7 +1777,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
 
 /// The sparse copy `[address, end)` lies in.
 fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
+    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK || !sparse_on() {
         return None;
     }
     SPARSE
@@ -1786,6 +1786,26 @@ fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .entry(address / CHUNK)
         .or_insert_with(|| sparse_buffer(address / CHUNK * CHUNK, CHUNK, None).map(Arc::new))
         .clone()
+}
+
+/// Diagnostics: `VICTORY_SPARSE=0` makes no sparse copies, so memory not
+/// used in place goes to the buffer and loose copies (the only ones that
+/// can be card buffers in VRAM). Shaders that read memory by address find
+/// no copy for it then. For measuring, not for play.
+fn sparse_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_SPARSE").is_none_or(|v| v != "0");
+            if !on {
+                tracing::warn!("VICTORY_SPARSE=0: no sparse copies of title memory");
+            }
+            on
+        })
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    true
 }
 
 /// The sparse copy of the 2 GiB `address` is in.
