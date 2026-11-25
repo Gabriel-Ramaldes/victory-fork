@@ -1,5 +1,109 @@
 # VIctory fork for AMD Radeon (work in progress)
 
+## This branch: `dev-belobug` (Gabriel-Ramaldes/victory-fork)
+
+A compatibility-research branch: the user's own Xbox Series dump, run on
+Windows through VIctory, measured on the machine below. Since 2026-11-25 it
+is based on [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+(`71652a2`), whose own README follows this section unchanged. No game files,
+keys or protected content are in this repository, and nothing here touches
+the game's protection mechanisms.
+
+### Test machine
+
+All numbers in this section come from this one machine:
+
+| Part | |
+|------|--|
+| Processor | AMD Ryzen 7 3700X, 8 cores / 16 threads |
+| Graphics | AMD Radeon RX 9070 XT 16 GB, driver 32.0.32029.2010 |
+| Memory | 32 GB DDR4 (4 x 8 GB, running at 2133 MT/s) |
+| Board | MSI MPG X570 Gaming Pro Carbon WiFi |
+| System | Windows 11 Pro, build 26300 |
+| Disks | game dump on a 5,400 rpm laptop hard disk (Seagate ST1000LM035) until 2026-11-25, then on an NVMe drive (XPG Gammix S41); caches on the NVMe drive |
+| Profile | Series X; diagnostics build (`--profile diag --features diagnostics`) |
+
+### Why the base changed
+
+Measured here on 2026-11-25, 15 to 25 minutes per run, the same scripted
+start (`VICTORY_KEYS=56:Enter`, `VICTORY_D3D12_DRED=1`); medians over the
+world's frames:
+
+| Tree | ms per frame | preparing (processor) | on the GPU | draws per frame | picture |
+|------|--------------|-----------------------|------------|-----------------|---------|
+| `dev-fxceless` before the fxceless merge (`7a8faf0`) | 441 | 132 | 214 | 4,927 | prologue drawn, interiors almost black |
+| `dev-fxceless` after it (`8dfc029`) | 590 to 615 | 137 to 138 | 160 to 214 | 2,920 to 4,925 | as before |
+| Belobug `71652a2` | 428 to 432 | 221 to 234 | 87 to 99 | 3,508 to 4,755 | prison interiors lit: corridors, cell block, office with sunlight, mission text |
+
+Belobug's tree spends less than half the GPU time and draws the interiors
+lit; on this processor the frame is then bound by the preparing on the
+processor. Its README's 3 to 5 frames per second are from a faster
+processor (Ryzen 7 9800X3D). The previous line is kept as the branch
+`dev-fxceless`.
+
+### Change history
+
+On this branch, over Belobug's `71652a2`:
+
+- 2026-11-25 `733d938` (from `fb05072`): frames go to the title's window,
+  the largest visible window of the process that is not a console, not the
+  first one in z-order (a run whose output was redirected presented to a
+  0x0 pseudo-console window and the title's window stayed white).
+- 2026-11-25 `1a5781e`: `VICTORY_CAPTURE_WORLD=<n>` saves the world's frames
+  counted from its first frame of 500 draws or more (the world started at
+  frame ~22,000 in one run and ~47,800 in another).
+
+On the previous line, `dev-fxceless` (fxceless/victory-fork with ports), by
+date; authors as in the history:
+
+- 2026-11-24 `ee868b1`: Windows environment check and install guide.
+- 2026-11-24 `4b5ef6e`: the shader optimiser's reuse pass keeps handle kinds
+  and resource sizes apart (two causes of a crash in AMD's shader compiler,
+  `amdxc64.dll+0x861b9f`). Not needed on this base, which has no such pass.
+- 2026-11-24 ports of Marvisak/VIctory: shader warm-up keyed by the
+  translator (`c446c40`), pipeline pre-build from the shader pack
+  (`3001f5b`), shader database formats (`9e40430`, `04f9262`).
+- 2026-11-24 `d47b441`: the pre-build gets past pipelines that crash the
+  host's compiler and later runs leave them out (27,116 pipelines in one pass).
+- 2026-11-24 `665c51a`: a timeline of what reaches the screen
+  (`timeline.jsonl`, `victory timeline`).
+- 2026-11-24 `fb05072`: the window choice above.
+- 2026-11-24/25 ports from myokex/victory-amd (`f53be64`, `35e9c83`,
+  `05f57f5`, `6838ca0`, `32c99c0`, `32b4a88`) and from pull requests of
+  fxceless/victory-fork: #552 by YeokiNoewChi (`f322386`, DirectStorage reads
+  into guarded memory), #452 by MalfoyDraco99 (`b84ad65`, AMD compiler
+  crash), #175 by Kamiloj9 (`f79caa3`, remapping locks scoped to ranges);
+  #523 by LeonardoS11 (`e305218`) was reverted (`7a8faf0`): slower here.
+- 2026-11-25 `d289d65`: the relay (submissions sent ahead) is off by default
+  on AMD: 4 of 7 runs lost the device about 10 minutes into the world with
+  it, none of about fifteen without it. `a1df776` (card copy limits) was a
+  wrong lead and is reverted (`edaa44a`).
+- 2026-11-25 `e25c4b8`, `8dfc029`: merge of fxceless/victory-fork `9376fd6`
+  and a fix of it; 590 to 615 ms per frame here (above).
+- 2026-11-25 `bd275ca`: the device-removed report names the host descriptor
+  slots a stopped draw read that were written after it was recorded (the
+  relay's device losses: none were).
+
+### Other people's work used here
+
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory): the base of every
+  line here (GPL-3.0-or-later).
+- [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD):
+  this branch's base since 2026-11-25.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and its
+  pull requests' authors (YeokiNoewChi, MalfoyDraco99, Kamiloj9,
+  LeonardoS11): the previous line's base and ports.
+- [myokex/victory-amd](https://github.com/myokex/victory-amd): AMD fixes
+  ported to the previous line.
+- [joshuudev/victory-amd](https://github.com/joshuudev/victory-amd) and
+  [Zettrox/ztrx](https://github.com/Zettrox/ztrx): read for comparison;
+  joshuudev's shader translation work (doubles, `v_permlane16`) is a
+  candidate for porting.
+
+This branch's changes were made with [Claude Code](https://claude.com/claude-code).
+
+---
+
 This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
 and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
 carries a number of upstream pull requests, and adds fixes found while running
