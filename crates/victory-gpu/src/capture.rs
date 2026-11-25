@@ -45,8 +45,45 @@ pub(crate) fn wanted(n: u64) -> bool {
             crate::resource::census_log();
             ASKED.store(n + 2, std::sync::atomic::Ordering::Relaxed);
         }
-        n.is_power_of_two() || listed(n) || std::fs::remove_file(f.join("want")).is_ok()
+        n.is_power_of_two() || listed(n) || in_world(n) || std::fs::remove_file(f.join("want")).is_ok()
     })
+}
+
+/// `VICTORY_CAPTURE_WORLD=<n>` (1 or no number: 30): from the first frame
+/// that ran 500 draws or more, two frames in a row every `n` (the title
+/// draws to two buffers in turn). Frame numbers at the world's start move
+/// by thousands from run to run (the menus' rate before it), so a list of
+/// numbers misses it; this counts from the world. After victory-gta6's
+/// switch of the same name, as an interval.
+fn in_world(n: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let first = WORLD.load(Relaxed);
+    first != u64::MAX && n > first && world_every().is_some_and(|every| (n - first) % every < 2)
+}
+
+/// The interval of [`in_world`], if `VICTORY_CAPTURE_WORLD` is set.
+fn world_every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let v = std::env::var("VICTORY_CAPTURE_WORLD").ok()?;
+        Some(v.trim().parse::<u64>().ok().filter(|&n| n > 1).unwrap_or(30))
+    })
+}
+
+/// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`: the draws run on the host so far.
+pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let before = LAST.swap(drawn, Relaxed);
+    if world_every().is_some()
+        && drawn.saturating_sub(before) >= 500
+        && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
+    {
+        tracing::info!(frame, every = world_every(), "the first frame of 500 draws or more: the world's frames are captured from here");
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

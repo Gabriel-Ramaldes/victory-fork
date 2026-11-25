@@ -393,8 +393,11 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
+    {
+        crate::capture::frame_drew(frame, crate::draw::drawn());
+        if crate::capture::listed(frame) {
+            crate::capture::dump_targets(frame);
+        }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     if let Some(target) = crate::capture::present_override(frame)
