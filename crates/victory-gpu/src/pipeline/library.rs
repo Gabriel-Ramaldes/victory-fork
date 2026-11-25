@@ -484,6 +484,13 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     used
 }
 
+/// Reads the early list before a save (the pre-build): `save` writes the
+/// list as held, and one never read would replace the runs' list with
+/// nothing.
+pub(crate) fn keep_early_list() {
+    drop(used());
+}
+
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
