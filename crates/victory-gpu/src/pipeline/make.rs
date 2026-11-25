@@ -66,14 +66,21 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        let key = key(&shaders, graphics.as_deref());
+        // One a pre-build found crashing the host's compiler is lost from the
+        // start: making it in a run would end the run.
+        let crashes = super::library::crashes_compiler(&key);
+        if crashes {
+            tracing::warn!(key, "a title pipeline that crashed the host's compiler in a pre-build: left out");
+        }
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
-            key: key(&shaders, graphics.as_deref()),
+            key,
             shaders,
             graphics,
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
-            lost: AtomicBool::new(false),
+            lost: AtomicBool::new(crashes),
             used: AtomicBool::new(false),
         }
     }
@@ -155,6 +162,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 
 /// Queues `p` for the workers, once.
 fn start(p: &Arc<Pending>) {
+    // Lost (its worker was, or a pre-build found it crashing the compiler):
+    // never made.
+    if p.lost.load(Ordering::Relaxed) {
+        return;
+    }
     if !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         queue(p.clone());

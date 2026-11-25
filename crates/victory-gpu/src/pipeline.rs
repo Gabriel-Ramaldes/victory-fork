@@ -784,12 +784,6 @@ impl Prebuild {
     }
 }
 
-/// Writes the pipeline library now (the pre-build's end).
-#[cfg(windows)]
-pub fn save_library() {
-    library::save(true);
-}
-
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
@@ -814,12 +808,22 @@ mod library;
 #[cfg(windows)]
 mod make;
 
+#[cfg(windows)]
+pub use library::{COMPILER_CRASHES_FILE, parse_compiler_crashes};
+
 /// Host pipelines made, and loaded from the library, since the start (the
-/// capture timeline).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn pipeline_counts() -> (u64, u64) {
+/// capture timeline, the pre-build's report).
+#[cfg(windows)]
+pub fn pipeline_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
+/// Whether an earlier run drew or dispatched with the title pipeline `key`
+/// (the pre-build makes those first).
+#[cfg(windows)]
+pub fn wanted_early(key: &str) -> bool {
+    library::wanted_early(key)
 }
 
 /// Pipelines queued and not made yet (the capture timeline).

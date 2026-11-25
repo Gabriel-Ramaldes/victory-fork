@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod timeline;
@@ -98,6 +99,19 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Make every pipeline of the title's shader pack ahead of a run, into
+    /// the pipeline library and shader cache a run reads (on this GPU and
+    /// driver; a second time only what is not there yet). A pipeline that
+    /// kills the process (the host's compiler) is found by the next
+    /// pre-build and left out by runs: run it again until it ends.
+    Prebuild {
+        /// Files or folders holding the shader pack and shaders (default:
+        /// the game folder).
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -177,6 +191,10 @@ fn main() -> Result<()> {
             jobs,
             host_lanes,
         } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        Command::Prebuild { paths, jobs } => {
+            let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+            prebuild::run(&default_paths(paths)?, threads.max(1))
+        }
         Command::Run {
             exe,
             unimplemented,

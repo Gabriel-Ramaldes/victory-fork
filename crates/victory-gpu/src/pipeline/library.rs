@@ -50,6 +50,35 @@ unsafe impl Send for Library {}
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
+
+/// Title pipeline keys whose making killed a pre-build (the host's shader
+/// compiler crashing on them), one per line: pre-builds skip them and runs
+/// leave them out (`victory prebuild`, after d47b441 on dev-fxceless).
+pub const COMPILER_CRASHES_FILE: &str = "host-compiler-crashes.txt";
+
+/// The keys of [`COMPILER_CRASHES_FILE`], as one file holds them.
+pub fn parse_compiler_crashes(text: &str) -> HashSet<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()
+}
+
+/// Whether the title pipeline `key` is listed in [`COMPILER_CRASHES_FILE`]
+/// (read once).
+pub(crate) fn crashes_compiler(key: &str) -> bool {
+    static LISTED: OnceLock<HashSet<String>> = OnceLock::new();
+    LISTED
+        .get_or_init(|| {
+            let text = DIR
+                .get()
+                .and_then(|d| std::fs::read_to_string(d.join(COMPILER_CRASHES_FILE)).ok())
+                .unwrap_or_default();
+            let listed = parse_compiler_crashes(&text);
+            if !listed.is_empty() {
+                tracing::info!(pipelines = listed.len(), "title pipelines that crash the host's compiler are left out");
+            }
+            listed
+        })
+        .contains(key)
+}
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
