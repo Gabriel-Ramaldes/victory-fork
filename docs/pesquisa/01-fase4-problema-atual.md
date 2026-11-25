@@ -45,10 +45,12 @@ Máquina:
 | vi-fx3 (myokex), relay off | ~490 ms | 137 | 153 | 131 s | caiu no driver (~1300 s) |
 | `dev-belobug` com profiler (15 min) | 407 ms | 222 | 89 | 128 s | 0 |
 | idem + bitmap no `watch` (save mais novo, ver §5) | 360 ms | 172 | 95 | 141 s | 0 |
+| A/B 6 min, save congelado: base | 349 ms | 177 | 76 | 121 s | 0 |
+| A/B 6 min, save congelado: bitmap no `watch` | 362 ms | 182 | 92 | 169 s | 0 |
 
-O último número **ainda não vale como ganho**: aquela rodada partiu de
-outro save (o jogo fez autosave), então a cena era outra. O A/B com o
-mesmo save foi interrompido (ver §6).
+A queda de 407 para 360 ms **não veio do bitmap**, e sim do save mais
+novo (o jogo fez autosave, e a cena era outra). No A/B com o mesmo save
+congelado, as duas versões ficam empatadas dentro do ruído.
 
 ## 3. Como um quadro passa pelo VIctory (resumo lido no código)
 
@@ -129,15 +131,20 @@ pipelines na fila do driver. O quadro já era dominado pela CPU.
   mas GPU e cópia de volta são maiores.
 - **Profiler (§4):** primeira vez que medimos onde vai a CPU, em vez de
   adivinhar.
-- **Bitmap no `watch` (não commitado):** troca dos conjuntos de blocos
-  (`BTreeSet`) por bits por região de 64 MiB, mesma trava e mesma ordem
-  de operações. 125 testes passam (2 novos). A primeira rodada deu
-  360 ms, mas num save diferente (ver §6).
+- **Bitmap no `watch` (branch `exp/watch-bitmap`, fora da
+  `dev-belobug`):** troca dos conjuntos de blocos (`BTreeSet`) por bits
+  por região de 64 MiB, mesma trava e mesma ordem de operações. 125
+  testes passam (2 novos).
+  - No A/B com o mesmo save, o tempo das consultas de escrita caiu
+    ~15-20% (403-428 → 322-377 ms por quadro, somado entre threads).
+  - O tempo por quadro não mudou (349 × 362 ms).
+  - Lição: a fila no mutex do `watch` não estava no caminho crítico do
+    quadro.
 - **Entrada simulada parou de funcionar:** com um controle XInput
   conectado, o teclado deixa de funcionar como controle, por desenho, e
   o `VICTORY_KEYS` (Enter → A) não chega. Três rodadas de 15 min ficaram
   na tela inicial, inclusive com o executável antigo. Foi criada a chave
-  de diagnóstico `VICTORY_HOST_PADS=0` (não commitada).
+  de diagnóstico `VICTORY_HOST_PADS=0` (commit 809a24f).
 - **Otimizações de shader pedidas:**
   - **alloca → SSA:** nenhum dos 26.503 shaders usa scratch, então não
     há `alloca` a promover;
@@ -167,7 +174,7 @@ pipelines na fila do driver. O quadro já era dominado pela CPU.
 |---|---|---|---|
 | 1 | Snapshot e comparação na CPU (~24% da thread) | profiler | descobrir por que os card buffers não ligam (log de `try_new`) |
 | 2 | Quadro serial (preparo → GPU → cópia de volta) | profiler, fps line | só depois de 1: sobrepor o preparo do envio N+1 com a GPU do N exige resolver as quedas do relay |
-| 3 | Consultas de escrita: 11 GB conferidos por quadro | copystat | terminar o A/B do bitmap; depois, cache por época de região (`region_epoch` já existe) |
+| 3 | Consultas de escrita: 11 GB conferidos por quadro | copystat | o bitmap não mudou o quadro (A/B); só vale atacar se o problema 1 sair do caminho antes |
 | 4 | `bindless_plan` (~10%) | profiler | ler as linhas quentes 1672-1816 |
 | 5 | Leituras de constantes dinâmicas, uma por dword | contagem do pack | só se uma rodada com `VICTORY_GPU_TIMING` mostrar esses shaders entre os caros |
 | 6 | Queda no culling com relay | klbf, fxceless | candidato: Belobug 78028ad (sem prova) |
