@@ -538,7 +538,13 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            let ms = MeshStream {
+                ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0)),
+                topology: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ),
+            };
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
@@ -685,6 +691,19 @@ impl HostPipeline {
 /// A stream subobject: its type, then its description, pointer-aligned.
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+
+/// A mesh pipeline's stages in a stream: the mesh shader and the topology
+/// type. The topology is said although a mesh shader's output sets it: the
+/// runtime keeps a mesh pipeline's as triangles, and a stream without it
+/// did not match the stored one, so no mesh pipeline was ever loaded from
+/// the library (the debug layer: "the pipeline state desc provided does
+/// not match the one used to create the PSO"); every run, and the
+/// pre-build again, compiled them all. As fxceless/victory-fork 578d459.
+#[repr(C)]
+struct MeshStream {
+    ms: Sub<D3D12_SHADER_BYTECODE>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
 
 #[repr(C)]
 struct VertexStream {
