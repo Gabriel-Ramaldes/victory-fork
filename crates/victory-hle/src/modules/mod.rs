@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod ffx;
+#[cfg(windows)]
 pub mod dualsense;
 #[cfg(windows)]
 pub mod files;
@@ -72,5 +74,11 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // AMD FidelityFX calls served by the PC upscaler (`VICTORY_FFX_DIR`,
+    // from PastiiJay/klbf-lab).
+    #[cfg(windows)]
+    if victory_gpu::ffx::enabled() {
+        all.push(ffx::module());
+    }
     all
 }

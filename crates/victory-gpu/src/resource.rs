@@ -829,6 +829,11 @@ struct Resource {
     /// yet.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
+    /// For the FidelityFX upscaler's output (`crate::ffx`), made on first
+    /// use: the host cannot write R9G9B9E5 from a shader, so the upscaler
+    /// writes a texture of its own, packed into this one after.
+    #[cfg(windows)]
+    fsr_output: std::sync::OnceLock<Option<Box<crate::ffx::rgb9e5::Output>>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1101,6 +1106,40 @@ pub(crate) fn depth_twin<'a>(this: This) -> Option<&'a crate::twin::Twin> {
     }
     let host = r.host.as_deref()?;
     host.twin.get_or_init(|| crate::twin::make(&host.texture)).as_ref()
+}
+
+/// The packing target of a title R9G9B9E5 texture the upscaler writes
+/// ([`Resource::fsr_output`]), if it is one. From PastiiJay/klbf-lab.
+#[cfg(windows)]
+pub(crate) fn rgb9e5_fsr_output(this: This) -> Option<&'static crate::ffx::rgb9e5::Output> {
+    if this.is_null() {
+        return None;
+    }
+    let resource = resource(this);
+    if !resource.desc.rgb9e5_fsr_candidate() {
+        return None;
+    }
+    let texture = host_copy(this)?;
+    resource
+        .fsr_output
+        .get_or_init(|| crate::ffx::rgb9e5::Output::new(&texture.texture).map(Box::new))
+        .as_deref()
+}
+
+#[cfg(windows)]
+impl ResourceDesc {
+    /// A single 2D R9G9B9E5 texture the title renders to and writes from
+    /// shaders: the upscaler's output.
+    fn rgb9e5_fsr_candidate(&self) -> bool {
+        // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        const TEXTURE_2D: u32 = 3;
+        self.format == SHARED_EXPONENT
+            && self.dimension == TEXTURE_2D
+            && self.depth_or_array_size == 1
+            && self.mip_levels == 1
+            && self.sample_count == 1
+            && self.flags & 0xf == 0x5
+    }
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1433,6 +1472,8 @@ fn hand_out_resource(
                 state: state.into(),
             })
         }),
+        #[cfg(windows)]
+        fsr_output: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
