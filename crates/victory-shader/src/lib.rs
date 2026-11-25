@@ -24,6 +24,12 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, container_programs, native_programs,
 };
 
+/// What this translator is built from (its sources, manifest, the
+/// workspace's lock file and the compiler's version, hashed by `build.rs`):
+/// caches of its translations are kept by it, so a rebuild that leaves the
+/// translator as it was keeps them.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

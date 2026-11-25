@@ -36,22 +36,34 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies the translations this build makes: the translator's
+/// sources (`victory_shader::SOURCE_HASH`), this file (which encodes the
+/// entries) and the translation settings it runs with (the loop limit,
+/// which a diagnostics build can change at run time, and rays). Keyed by
+/// our executable before, every rebuild, whatever it changed, translated
+/// all of the title's shaders again in its first run.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         // Diagnostics (`VICTORY_SHADER_BUILD_OF=<executable>`): the entries
-        // of another build, for a build whose translation is the same (a
-        // change elsewhere), which then need not be made again.
+        // an older build keyed by its executable made, which then need not
+        // be made again.
         let other = std::env::var_os("VICTORY_SHADER_BUILD_OF")
             .filter(|_| cfg!(feature = "diagnostics"))
             .map(std::path::PathBuf::from);
         if let Some(other) = &other {
             tracing::warn!(of = %other.display(), "shader cache entries of another build are used");
         }
-        let exe = other.map_or_else(std::env::current_exe, Ok).and_then(std::fs::read);
+        let made_by = match other {
+            Some(other) => std::fs::read(other),
+            None => Ok([
+                b"translator ".as_slice(),
+                victory_shader::SOURCE_HASH.as_bytes(),
+                b" entries ".as_slice(),
+                blake3::hash(include_bytes!("shader_cache.rs")).as_bytes(),
+            ]
+            .concat()),
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -59,7 +71,7 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
+        match made_by {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(victory_shader::emit::rays().into());
