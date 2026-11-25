@@ -393,6 +393,14 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
+    /// The relay stays off by default on AMD, on elsewhere.
+    #[test]
+    fn the_relay_is_off_by_default_on_amd() {
+        assert!(!super::relay_by_default(Some(0x1002)));
+        assert!(super::relay_by_default(Some(0x10de)));
+        assert!(super::relay_by_default(None));
+    }
+
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
@@ -474,12 +482,35 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
-    // turns it off, `=1` asks for the first stage.
+    // On by default (stage 2, `crate::host::relay_exact`) but on AMD
+    // ([`relay_by_default`]); `VICTORY_RELAY=0` turns it off, `=1` asks for
+    // the first stage, `=2` for the second.
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_RELAY").map_or_else(
+            |_| !cfg!(test) && relay_by_default(crate::host::host().and_then(|h| h.vendor())),
+            |v| v == "1" || v == "2",
+        ) && !keeps();
+        tracing::info!(on, "the relay (submissions sent ahead, shader writes landed by a thread of their own)");
+        on
+    })
+}
+
+/// Whether the relay is on unless `VICTORY_RELAY` says, for the host GPU's
+/// vendor.
+///
+/// victory-fork c96b4f2 turned it on by default (about 230 ms a frame
+/// where it was about 400 on an RTX 4070). On an RX 9070 XT (driver
+/// 32.0.32029) 4 of 7 runs of 15 minutes with it lost the device, each
+/// about 10 minutes in, on a page fault right after or before a title
+/// memory copy with one or two submissions sent ahead (what a resource
+/// freed while a submission sent ahead still reads looks like); none of
+/// some fifteen runs without it did. Off on AMD until that is found.
+fn relay_by_default(vendor: Option<u32>) -> bool {
+    const AMD: u32 = 0x1002;
+    vendor != Some(AMD)
 }
 
 /// The submission being prepared (its number among those started): what
