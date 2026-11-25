@@ -142,21 +142,43 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`, by default
+/// [`default_card_limits`] for the host's GPU. Run 69's gameplay has ten
+/// title buffers of 16 MiB or more, 494 MB, and 1,650 MB of the card's
+/// budget free.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
+        let vendor = crate::host::host().and_then(|h| h.vendor());
+        let (min, most) = default_card_limits(vendor);
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        let limits = (mb("VICTORY_CARD_BUFFERS_MIN_MB", min).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", most));
+        tracing::info!(
+            vendor = format_args!("{:#x}", vendor.unwrap_or(0)),
+            min_mb = limits.0 >> 20,
+            most_mb = limits.1 >> 20,
+            "title buffers copied to the card's memory"
+        );
+        limits
     })
+}
+
+/// The card copies' default limits in MB (smallest buffer, all bytes) for
+/// the host's GPU vendor.
+///
+/// From 1 MiB up and 1,024 MB in all (victory-fork c96b4f2; it was 16 and
+/// 512): the shader writes of the smaller buffers are then found by the
+/// card's hashes too, and with that the first room's walls were drawn in
+/// every run (RTX 4070). On AMD (RX 9070 XT, driver 32.0.32029) those
+/// limits removed the device in 2 of 3 runs of 15 minutes, each 10 minutes
+/// in (a page fault with a submission sent ahead, VICTORY_RELAY=1); with 16
+/// and 512 none of 3 did, at the same frame time (320 against 334 ms a
+/// frame in the same scene). AMD keeps 16 and 512.
+fn default_card_limits(vendor: Option<u32>) -> (u64, u64) {
+    const AMD: u32 = 0x1002;
+    if vendor == Some(AMD) { (16, 512) } else { (1, 1024) }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -393,6 +415,14 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
+    /// AMD keeps the smaller card copies; other hosts take the wider ones.
+    #[test]
+    fn card_limits_follow_the_host_vendor() {
+        assert_eq!(super::default_card_limits(Some(0x1002)), (16, 512));
+        assert_eq!(super::default_card_limits(Some(0x10de)), (1, 1024));
+        assert_eq!(super::default_card_limits(None), (1, 1024));
+    }
+
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
