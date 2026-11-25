@@ -769,10 +769,14 @@ impl Prebuild {
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
-        let quiet = tracing::Dispatch::none();
-        let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
-        });
+        // Logged after all with `VICTORY_PREBUILD_MADE_LOG` (diagnostics: why
+        // a pipeline is made again, the debug layer's lines included).
+        let make = || host::HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        let made = if std::env::var_os("VICTORY_PREBUILD_MADE_LOG").is_some() {
+            make()
+        } else {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), make)
+        };
         library::save(false);
         match made {
             Some(_) => Ok(()),

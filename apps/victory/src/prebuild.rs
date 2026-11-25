@@ -243,11 +243,19 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         (made - made0, loaded - loaded0)
     };
     // A job, with its key in the journal while the host makes it.
+    // Diagnostics, `VICTORY_PREBUILD_MADE_LOG=1` (with `--jobs 1`): each
+    // pipeline the host made rather than loaded from the library, by key,
+    // job and shaders (a library that should hold it does not).
+    let made_log = std::env::var_os("VICTORY_PREBUILD_MADE_LOG").is_some();
     let make = |job: Job| {
         let made = prepare(job).and_then(|p| {
             let key = p.key();
             journal.begin(&key);
+            let before = pipeline::pipeline_counts().0;
             let made = p.make();
+            if made_log && pipeline::pipeline_counts().0 > before {
+                eprintln!("made, not loaded: {key} {job:?} {}", p.describe());
+            }
             journal.end(&key);
             made
         });

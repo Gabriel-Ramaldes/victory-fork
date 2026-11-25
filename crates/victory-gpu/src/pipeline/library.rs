@@ -400,9 +400,18 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+    let loaded = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr()));
+    match loaded {
+        Ok(pso) => {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
+        // Diagnostics: why a pipeline was not loaded, once per error (a
+        // pre-built library of which a part is made again in every run).
+        #[cfg(feature = "diagnostics")]
+        Err(e) => note_library_error("load", name, &e),
+        #[cfg(not(feature = "diagnostics"))]
+        Err(_) => {}
     }
     // Compiled outside the lock: compiles take up to seconds.
     let pso = create()?;
@@ -410,10 +419,39 @@ pub(crate) fn pipeline(
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
+    match unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) } {
+        Ok(()) => l.added += 1,
+        #[cfg(feature = "diagnostics")]
+        Err(e) => note_library_error("store", name, &e),
+        #[cfg(not(feature = "diagnostics"))]
+        Err(_) => {}
     }
     Ok(pso)
+}
+
+/// Diagnostics: a library load or store that failed, counted by error and
+/// logged the first time each error comes (with the pipeline's name).
+#[cfg(feature = "diagnostics")]
+fn note_library_error(what: &'static str, name: &str, e: &windows::core::Error) {
+    static SEEN: Mutex<Vec<(&'static str, i32, u64)>> = Mutex::new(Vec::new());
+    let code = e.code().0;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    match seen.iter_mut().find(|s| s.0 == what && s.1 == code) {
+        Some(s) => {
+            s.2 += 1;
+            if s.2.is_power_of_two() {
+                tracing::info!(what, hresult = %format_args!("{code:#010x}"), count = s.2, "pipeline library calls failing");
+            }
+        }
+        None => {
+            seen.push((what, code, 1));
+            tracing::warn!(what, hresult = %format_args!("{code:#010x}"), error = %e, name, "a pipeline library call failed");
+            // The pre-build makes pipelines with logging off: said here too,
+            // with the debug layer's reason (`VICTORY_D3D12_DEBUG`).
+            let layer = crate::host::host().and_then(|h| h.log_messages());
+            eprintln!("pipeline library {what} failed: {code:#010x} ({e}) for {name}; debug layer: {layer:?}");
+        }
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
