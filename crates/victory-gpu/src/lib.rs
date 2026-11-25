@@ -72,6 +72,8 @@ mod texpool;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+mod fpsbox;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
