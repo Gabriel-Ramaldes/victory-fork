@@ -2822,14 +2822,6 @@ impl Host {
         })
     }
 
-    /// The host GPU's PCI vendor (0x1002 AMD, 0x10de NVIDIA, 0x8086 Intel),
-    /// if DXGI says.
-    pub(crate) fn vendor(&self) -> Option<u32> {
-        // SAFETY: a plain query of a live adapter.
-        let desc = unsafe { self.adapter.as_ref()?.GetDesc1().ok()? };
-        Some(desc.VendorId)
-    }
-
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
