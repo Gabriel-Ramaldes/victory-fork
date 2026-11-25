@@ -13,7 +13,7 @@
 //! pipelines there (it loads them from the library: this tree keeps no
 //! list of what a pre-build made).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +39,9 @@ enum Job {
 
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+    let dir = victory_core::Config::load()?.cache_subdir("pipelines")?;
+    pipeline::use_pipeline_cache(dir.clone());
+    let journal = Journal::open(&dir);
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
@@ -202,10 +204,17 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // port note, so those are found by loading them from the library.)
     let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
+    // Suspects of the last pre-build's end (see `Journal`), made first,
+    // one at a time.
+    let suspected: Mutex<Vec<Job>> = Mutex::new(Vec::new());
     each(&jobs, threads, |job| match prepare(job) {
         Ok(p) if keys_only.is_some() => {
             lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
         }
+        Ok(p) if journal.crashes.contains(&p.key()) => {
+            skip("it crashed the host's compiler in an earlier pre-build".into())
+        }
+        Ok(p) if journal.suspects.contains(&p.key()) => lock(&suspected).push(job),
         Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
         Err(why) => {
             if keys_only.is_some() {
@@ -221,20 +230,41 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     todo.sort_by_key(|&(later, _)| later);
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
 
-    let next = AtomicUsize::new(0);
     let (made0, loaded0) = pipeline::pipeline_counts();
     let counts = || {
         let (made, loaded) = pipeline::pipeline_counts();
         (made - made0, loaded - loaded0)
     };
+    // A job, with its key in the journal while the host makes it.
+    let make = |job: Job| {
+        let made = prepare(job).and_then(|p| {
+            let key = p.key();
+            journal.begin(&key);
+            let made = p.make();
+            journal.end(&key);
+            made
+        });
+        if let Err(why) = made {
+            skip(why);
+        }
+    };
+    let suspected = suspected.into_inner().unwrap_or_else(|e| e.into_inner());
+    if !suspected.is_empty() {
+        eprintln!(
+            "{} pipelines were being made when the last pre-build ended: made one at a time first",
+            suspected.len()
+        );
+        for &job in &suspected {
+            make(job);
+        }
+    }
+    let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads.min(todo.len()))
             .map(|_| {
                 s.spawn(|| {
                     while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if let Err(why) = prepare(job).and_then(|p| p.make()) {
-                            skip(why);
-                        }
+                        make(job);
                     }
                 })
             })
@@ -246,6 +276,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         });
     });
     pipeline::save_pipeline_cache();
+    journal.finish();
     let (made, loaded) = counts();
     println!(
         "pipelines    {} in the pack, {:.1} s: {made} made, {loaded} already in the library",
@@ -256,6 +287,100 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         println!("  {n:>7}  skipped: {why}");
     }
     Ok(())
+}
+
+/// What a pre-build keeps on disk to get past a pipeline whose making kills
+/// the process (the host's compiler crashing: on AMD every pre-build
+/// stopped at the same pipeline, 6% in). While the host makes pipelines,
+/// [`INFLIGHT_FILE`] lists their keys. A pre-build that finds it was not
+/// left by a finished one: if it names one pipeline, that one killed the
+/// process, and goes into [`pipeline::COMPILER_CRASHES_FILE`] (skipped by
+/// pre-builds, left out by runs); if it names several, they are made first,
+/// one at a time, so the next end names the culprit alone.
+struct Journal {
+    file: PathBuf,
+    crashes_file: PathBuf,
+    /// Keys that crashed the compiler before, and the last end's suspects.
+    crashes: HashSet<String>,
+    suspects: HashSet<String>,
+    making: Mutex<HashSet<String>>,
+}
+
+/// Keys of the pipelines being made (see [`Journal`]).
+const INFLIGHT_FILE: &str = "prebuild-inflight.txt";
+
+impl Journal {
+    fn open(dir: &std::path::Path) -> Journal {
+        let file = dir.join(INFLIGHT_FILE);
+        let crashes_file = dir.join(pipeline::COMPILER_CRASHES_FILE);
+        let mut crashes =
+            pipeline::parse_compiler_crashes(&std::fs::read_to_string(&crashes_file).unwrap_or_default());
+        let inflight = std::fs::read_to_string(&file).unwrap_or_default();
+        let (suspects, culprit) = after_an_end(&inflight, &crashes);
+        if let Some(key) = culprit {
+            eprintln!("pipeline {key} killed the last pre-build (the host's compiler): skipped from now on, and left out by runs");
+            crashes.insert(key);
+            let mut list: Vec<&str> = crashes.iter().map(String::as_str).collect();
+            list.sort_unstable();
+            if let Err(e) = std::fs::write(&crashes_file, list.join("\n") + "\n") {
+                eprintln!("{}: not written ({e})", crashes_file.display());
+            }
+        }
+        let _ = std::fs::remove_file(&file);
+        Journal {
+            file,
+            crashes_file,
+            crashes,
+            suspects,
+            making: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The host starts making `key`.
+    fn begin(&self, key: &str) {
+        let mut making = lock(&self.making);
+        making.insert(key.to_owned());
+        self.write(&making);
+    }
+
+    /// The host is done with `key` (made, refused or found).
+    fn end(&self, key: &str) {
+        let mut making = lock(&self.making);
+        making.remove(key);
+        self.write(&making);
+    }
+
+    /// Written whole each time; a process that dies leaves the last one (a
+    /// write the system has taken survives the process).
+    fn write(&self, making: &HashSet<String>) {
+        let mut keys: Vec<&str> = making.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        let _ = std::fs::write(&self.file, keys.join("\n"));
+    }
+
+    /// The pre-build ended by itself: nothing was left being made.
+    fn finish(&self) {
+        let _ = std::fs::remove_file(&self.file);
+        if !self.crashes.is_empty() {
+            eprintln!(
+                "{} pipelines skipped as crashing the host's compiler ({})",
+                self.crashes.len(),
+                self.crashes_file.display()
+            );
+        }
+    }
+}
+
+/// What the journal of a pre-build that did not finish says: the keys it
+/// was making that are not known to crash, and the culprit when it was
+/// making one alone.
+fn after_an_end(inflight: &str, crashes: &HashSet<String>) -> (HashSet<String>, Option<String>) {
+    let mut suspects = pipeline::parse_compiler_crashes(inflight);
+    suspects.retain(|k| !crashes.contains(k));
+    if suspects.len() == 1 {
+        return (HashSet::new(), suspects.into_iter().next());
+    }
+    (suspects, None)
 }
 
 /// Runs `f` on every job, on `threads` threads.
@@ -293,4 +418,46 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| (*k).to_owned()).collect()
+    }
+
+    /// One pipeline being made when the process died is the culprit;
+    /// several are suspects, made one at a time; known crashes and a
+    /// finished pre-build (no journal) name nothing.
+    #[test]
+    fn the_journal_names_the_pipeline_that_killed_the_process() {
+        assert_eq!(after_an_end("a\n", &set(&[])), (set(&[]), Some("a".to_owned())));
+        assert_eq!(after_an_end("a\nb\nc", &set(&[])), (set(&["a", "b", "c"]), None));
+        assert_eq!(after_an_end("a\nb", &set(&["b"])), (set(&[]), Some("a".to_owned())));
+        assert_eq!(after_an_end("b", &set(&["b"])), (set(&[]), None));
+        assert_eq!(after_an_end("", &set(&["b"])), (set(&[]), None));
+    }
+
+    /// A journal written, the process gone, and the next pre-build opening
+    /// it: the culprit goes into the crash list, which a run reads too.
+    #[test]
+    fn a_culprit_is_kept_for_pre_builds_and_runs() {
+        let dir = std::env::temp_dir().join(format!("victory-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = Journal::open(&dir);
+        first.begin("a");
+        first.begin("b");
+        first.end("b");
+        drop(first); // as if the process had died making "a"
+        let second = Journal::open(&dir);
+        assert!(second.crashes.contains("a") && second.suspects.is_empty());
+        let listed = std::fs::read_to_string(dir.join(pipeline::COMPILER_CRASHES_FILE)).unwrap();
+        assert_eq!(pipeline::parse_compiler_crashes(&listed), set(&["a"]));
+        second.finish();
+        assert!(!dir.join(INFLIGHT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

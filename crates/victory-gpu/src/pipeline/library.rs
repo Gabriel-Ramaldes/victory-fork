@@ -62,6 +62,38 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// Title pipelines (by key, one a line) whose making killed the process
+/// in a pre-build: the host's compiler read null and took the process
+/// down (AMD's amdxc64.dll, bvh_skinning CSComputeSkinningTreeAnimVelocity:
+/// every pre-build stopped at the same pipeline). The pre-build finds them
+/// (`prebuild.rs`) and skips them; a run leaves them out, its draws or
+/// dispatches dropped, instead of ending the same way.
+pub const COMPILER_CRASHES_FILE: &str = "host-compiler-crashes.txt";
+
+/// The keys of [`COMPILER_CRASHES_FILE`], as one file holds them.
+pub fn parse_compiler_crashes(text: &str) -> HashSet<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()
+}
+
+/// Whether the title pipeline `key` is listed in [`COMPILER_CRASHES_FILE`]
+/// (read once).
+pub(crate) fn crashes_compiler(key: &str) -> bool {
+    static LISTED: OnceLock<HashSet<String>> = OnceLock::new();
+    LISTED
+        .get_or_init(|| {
+            let text = DIR
+                .get()
+                .and_then(|d| std::fs::read_to_string(d.join(COMPILER_CRASHES_FILE)).ok())
+                .unwrap_or_default();
+            let listed = parse_compiler_crashes(&text);
+            if !listed.is_empty() {
+                tracing::info!(pipelines = listed.len(), "title pipelines that crash the host's compiler are left out");
+            }
+            listed
+        })
+        .contains(key)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);

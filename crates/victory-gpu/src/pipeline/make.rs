@@ -102,7 +102,10 @@ impl Pending {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
             format!("{shaders:?}\t{state}")
         });
-        let left_out = left_out(&shaders);
+        let left_out = left_out(&shaders).or_else(|| {
+            super::library::crashes_compiler(&key)
+                .then_some("crashed the host's compiler in a pre-build, left out")
+        });
         Pending {
             key,
             shaders,

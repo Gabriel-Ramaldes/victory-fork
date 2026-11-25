@@ -802,6 +802,8 @@ pub(crate) fn library_removal_note() -> String {
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
+pub use library::{COMPILER_CRASHES_FILE, parse_compiler_crashes};
+
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
