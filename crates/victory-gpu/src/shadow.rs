@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -2205,14 +2205,55 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     if let Some(window) = direct(address, end) {
+        path(Path::Direct);
         return Some(window);
     }
     find_copy(address, len)
 }
 
+/// Diagnostics: which way [`find`] and [`loose`] served ranges, and which
+/// copies they made (counted, printed with the periodic copy line).
+#[derive(Clone, Copy)]
+enum Path {
+    Direct,
+    Sparse,
+    Buffer,
+    Loose,
+    BufferMade,
+    BufferCard,
+    LooseMade,
+    LooseCard,
+}
+
+static PATHS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn path(p: Path) {
+    PATHS[p as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Diagnostics: ranges served by each way so far, the copies made on the
+/// two ways that can place one in VRAM, and the card buffer refusals.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn paths_text() -> String {
+    let n = |p: Path| PATHS[p as usize].load(Ordering::Relaxed);
+    format!(
+        "copy paths: in place {}, sparse {}, buffer {} (made {}, in VRAM {}), loose {} (made {}, in VRAM {}); {}",
+        n(Path::Direct),
+        n(Path::Sparse),
+        n(Path::Buffer),
+        n(Path::BufferMade),
+        n(Path::BufferCard),
+        n(Path::Loose),
+        n(Path::LooseMade),
+        n(Path::LooseCard),
+        crate::card::refusals_text()
+    )
+}
+
 fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     if let Some(copy) = sparse(address, end) {
+        path(Path::Sparse);
         return Some(copy);
     }
     let mut map = buffers();
@@ -2241,8 +2282,10 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let h = host()?;
         let (staging, data) = h.shared_buffer(size)?;
         crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
+        path(Path::BufferMade);
         let (buffer, card) = match crate::card::CardState::try_new(h, &staging, size) {
             Some(card) => {
+                path(Path::BufferCard);
                 let vram = card.vram.clone();
                 crate::host::name(&vram, || format!("title buffer {:#x}+{len:#x} VRAM", key.0));
                 tracing::info!(
@@ -2273,6 +2316,7 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len, card)));
     }
+    path(Path::Buffer);
     entry.shadow.clone()
 }
 
@@ -2310,6 +2354,7 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
+        path(Path::Sparse);
         return Some(copy);
     }
     let start = address & !(WINDOW - 1);
@@ -2324,13 +2369,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .find(|((s, l), _)| *s <= address && s + l >= end)
         .map(|(_, shadow)| shadow.clone())
     {
+        path(Path::Loose);
         return Some(shadow);
     }
     let h = host()?;
     let (staging, data) = h.shared_buffer(len)?;
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
+    path(Path::LooseMade);
     let (buffer, card) = match crate::card::CardState::try_new(h, &staging, len) {
         Some(card) => {
+            path(Path::LooseCard);
             let vram = card.vram.clone();
             crate::host::name(&vram, || format!("title memory {start:#x}+{len:#x} VRAM"));
             tracing::info!(
@@ -2351,6 +2399,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, card));
     map.insert((start, len), shadow.clone());
+    path(Path::Loose);
     Some(shadow)
 }
 

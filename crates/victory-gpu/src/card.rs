@@ -131,6 +131,45 @@ fn limits() -> (u64, u64) {
     })
 }
 
+/// Why [`CardState::try_new`] left a buffer in host memory.
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    Disabled,
+    Size,
+    Engine,
+    Budget,
+    Total,
+    Allocation,
+}
+
+/// Diagnostics: logs the first refusal of each kind (with the numbers it
+/// was decided on) and counts them all; no line per buffer.
+fn refused(why: Refusal, size: u64, a: u64, b: u64) {
+    static SEEN: [AtomicBool; 6] = [const { AtomicBool::new(false) }; 6];
+    REFUSALS[why as usize].fetch_add(1, Ordering::Relaxed);
+    if !SEEN[why as usize].swap(true, Ordering::Relaxed) {
+        tracing::info!(?why, size, a, b, "card buffer refused (first of its kind; counts in the copy paths line)");
+    }
+}
+
+/// Refusals by [`Refusal`], in its order.
+static REFUSALS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Diagnostics: card buffer refusals so far, by kind.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn refusals_text() -> String {
+    let n = |k: usize| REFUSALS[k].load(Ordering::Relaxed);
+    format!(
+        "card refused: disabled {}, size {}, engine {}, budget {}, total {}, allocation {}",
+        n(0),
+        n(1),
+        n(2),
+        n(3),
+        n(4),
+        n(5)
+    )
+}
+
 pub(crate) fn hash_table_bytes(size: u64) -> u64 {
     ((size / PAGE as u64 + 1) * 16).next_multiple_of(256)
 }
@@ -177,26 +216,35 @@ impl CardState {
     /// `PAGE`) if enabled and within VRAM budget.
     pub(crate) fn try_new(host: &Host, staging: &ID3D12Resource, size: u64) -> Option<Arc<Self>> {
         if !enabled() {
+            refused(Refusal::Disabled, size, 0, 0);
             return None;
         }
         let (min_bytes, max_bytes) = limits();
         if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
+            refused(Refusal::Size, size, min_bytes, 1 << 30);
             return None;
         }
         if !host.card_ready() {
+            refused(Refusal::Engine, size, 0, 0);
             return None;
         }
         if let Some([(used, budget), _]) = crate::host::video_memory()
             && budget > 0
             && used.saturating_add(size) > budget * 75 / 100
         {
+            refused(Refusal::Budget, size, used, budget);
             return None;
         }
         if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > max_bytes {
             CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            refused(Refusal::Total, size, CARD_BYTES[0].load(Ordering::Relaxed), max_bytes);
             return None;
         }
-        Self::new_unchecked(host, staging, size, true)
+        let made = Self::new_unchecked(host, staging, size, true);
+        if made.is_none() {
+            refused(Refusal::Allocation, size, 0, 0);
+        }
+        made
     }
 
     /// Creates a `CardState` directly (used by `try_new` and WARP unit tests).
