@@ -940,6 +940,11 @@ struct Deferred {
     /// How many of `writes` this submission has done already.
     early: usize,
     wait_marks: Vec<usize>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<usize>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -1267,7 +1272,7 @@ impl Host {
             && cpu_back.is_empty()
             && runs.iter().all(|list| {
                 let d = list.deferred();
-                d.readbacks.is_empty() && d.writes[d.early..].is_empty()
+                d.readbacks.is_empty() && d.texture_backs.is_empty() && d.writes[d.early..].is_empty()
             });
         if let Some(first) = first {
             // SAFETY: a closed list.
@@ -1474,6 +1479,11 @@ impl Host {
                     n
                 };
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
+            // Textures shaders wrote that the title reads on the CPU
+            // ([`crate::texback`]).
+            for back in &list.deferred().texture_backs {
+                crate::texback::land(back);
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1832,7 +1842,38 @@ impl HostList {
         }
     }
 
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.contains(&(resource as usize)) {
+            deferred.back_wanted.push(resource as usize);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for resource in wanted {
+            let resource = resource as crate::object::This;
+            let Some(copy) = crate::resource::host_copy(resource) else {
+                continue;
+            };
+            crate::list::ensure_state(self, resource, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     pub(crate) fn close(&self) {
+        self.textures_back();
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
