@@ -6090,8 +6090,15 @@ impl Host {
     }
 }
 
-/// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// The window the title made, if it made one: of this process's visible
+/// top-level windows, the largest that is not a console's ([`pick_window`]).
+///
+/// The first visible one in z-order was taken before. With its output
+/// redirected the process also owns a visible pseudo-console window of
+/// 0x0, and when that one was ahead of the title's (another program in
+/// front as the first frame came) the swap chain went to it: the title's
+/// window stayed white for the whole run, its caption without the frame
+/// rate, while the frames were drawn and saved (a run of 2026-11-24).
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
@@ -6101,16 +6108,33 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
             {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+                let mut class = [0u16; 64];
+                let n = GetClassNameW(hwnd, &mut class).max(0) as usize;
+                let mut rect = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rect);
+                let area = i64::from(rect.right - rect.left).max(0) * i64::from(rect.bottom - rect.top).max(0);
+                let found = &mut *(found.0 as *mut Vec<(HWND, String, i64)>);
+                found.push((hwnd, String::from_utf16_lossy(&class[..n]), area));
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
+    let mut found: Vec<(HWND, String, i64)> = Vec::new();
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    let candidates: Vec<(&str, i64)> = found.iter().map(|(_, c, a)| (c.as_str(), *a)).collect();
+    pick_window(&candidates).map(|i| found[i].0)
+}
+
+/// Which of a process's visible windows (class, area) is the title's: the
+/// largest of some size that is not a console's.
+fn pick_window(windows: &[(&str, i64)]) -> Option<usize> {
+    windows
+        .iter()
+        .enumerate()
+        .filter(|(_, (class, area))| *area > 0 && !matches!(*class, "PseudoConsoleWindow" | "ConsoleWindowClass"))
+        .max_by_key(|(_, (_, area))| *area)
+        .map(|(i, _)| i)
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
@@ -6577,5 +6601,24 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    /// The title's window, not the 0x0 pseudo-console a redirected run owns
+    /// (ahead of it in z-order in the run whose window stayed white), nor a
+    /// console, nor a smaller window of the title's.
+    #[test]
+    fn the_title_window_is_the_largest_that_is_not_a_console() {
+        let seen = [
+            ("PseudoConsoleWindow", 0),
+            ("sgaWindowClass", 2474 * 1392),
+            ("ConsoleWindowClass", 1280 * 720 * 4),
+            ("SplashClass", 640 * 360),
+        ];
+        assert_eq!(super::pick_window(&seen), Some(1));
+        assert_eq!(super::pick_window(&seen[..1]), None);
+        assert_eq!(super::pick_window(&[]), None);
     }
 }
