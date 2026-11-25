@@ -1152,6 +1152,10 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            #[cfg(feature = "diagnostics")]
+            if !host_pads() {
+                return None;
+            }
             let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
             if !empty {
                 let mut state = XINPUT_STATE::default();
@@ -1303,6 +1307,18 @@ mod host {
         tracing::info!(key = name, "a key was asked for");
         a.held = key_named(&name).map(|vk| (now, vk));
         a.held.map(|h| h.1)
+    }
+
+    /// Debugging aid: `VICTORY_HOST_PADS=0` leaves the host's pads (XInput
+    /// and DualSense) out, so that the keyboard's stand-in pad, and with it
+    /// `VICTORY_KEYS`, drives the title while a pad is connected (the stand-in
+    /// is there only while no host pad is; an unattended run with a pad left
+    /// on never left the start screen, 2026-11-25).
+    #[cfg(feature = "diagnostics")]
+    fn host_pads() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("VICTORY_HOST_PADS").is_none_or(|v| v != "0"));
+        *ON
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
