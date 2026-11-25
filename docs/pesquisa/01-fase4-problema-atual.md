@@ -93,9 +93,32 @@ Contadores por quadro (`copystat`):
 - buffers de 50-75 MB atualizados 12-13 vezes por quadro.
 
 O modo "card buffers" do Belobug, que deixa buffers grandes na VRAM e
-compara as páginas na GPU, foi feito justamente para eliminar o snapshot
-e a comparação. Nesta máquina ele **nunca ligou** (nenhuma linha de log
-do motor). O motivo ainda não foi investigado.
+compara as páginas na GPU, foi feito para eliminar o snapshot e a
+comparação. Nesta máquina ele **nunca ligava**. Investigado (commits
+9f07c9d e 84e507c):
+
+- **Causa:** `CardState::try_new` só é chamada pelos caminhos "buffer" e
+  "loose" de `shadow::find_copy`. A cópia esparsa (blocos de 2 GiB, com
+  `card: None` fixo) é tentada antes e atende tudo o que não é usado no
+  lugar. Numa rodada de 4 min: no lugar 20,6 M, esparso 5,1 M,
+  buffer/loose 0, recusas 0. Os ~24% de snapshot e comparação do
+  profiler são `sparse_writing` e `sparse_back`.
+- **A/B com `VICTORY_SPARSE=0`** (só diagnóstico; os card buffers passam
+  a ser usados), mesmo save, 6 min, mediana dos últimos 25 registros:
+
+  | | Quadro | Cópias | Planos | GPU | Cópia de volta | RAM |
+  |---|---|---|---|---|---|---|
+  | esparso ligado | 342 ms | 52,9 | 25,6 | 71,7 | 84,4 | 25,3 GB |
+  | esparso desligado | 375 ms | 63,0 | 38,3 | 86,3 | 81,9 | 28,9 GB |
+
+  - Vão para a VRAM 410 das 1.024 cópias; o resto é recusado por tamanho
+    (< 4 MiB), orçamento de VRAM (75%) e teto de 2 GiB.
+  - O snapshot esparso some, mas o custo reaparece em cópias, planos e
+    GPU, e a cópia de volta não muda. A imagem é igual nas duas rodadas.
+- **Conclusão:** ligar os card buffers como estão **não reduz** o tempo
+  por quadro. O custo real não é o memmove do snapshot isolado, e sim
+  quanto o jogo escreve pela GPU e precisa voltar para a CPU (~80 ms de
+  cópia de volta nos dois casos).
 
 ## 5. Linha do tempo: melhorias e percalços
 
@@ -172,7 +195,7 @@ pipelines na fila do driver. O quadro já era dominado pela CPU.
 
 | # | Problema | Evidência | Próximo passo barato |
 |---|---|---|---|
-| 1 | Snapshot e comparação na CPU (~24% da thread) | profiler | descobrir por que os card buffers não ligam (log de `try_new`) |
+| 1 | Snapshot e comparação na CPU (~24% da thread) | profiler, A/B | card buffers testados: não ajudam (§4). Próximo: medir **quais** intervalos a GPU de fato escreve e o jogo lê (a cópia de volta), antes de otimizar o snapshot |
 | 2 | Quadro serial (preparo → GPU → cópia de volta) | profiler, fps line | só depois de 1: sobrepor o preparo do envio N+1 com a GPU do N exige resolver as quedas do relay |
 | 3 | Consultas de escrita: 11 GB conferidos por quadro | copystat | o bitmap não mudou o quadro (A/B); só vale atacar se o problema 1 sair do caminho antes |
 | 4 | `bindless_plan` (~10%) | profiler | ler as linhas quentes 1672-1816 |
