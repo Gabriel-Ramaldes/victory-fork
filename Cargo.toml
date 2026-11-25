@@ -58,9 +58,17 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# Thin link-time optimization and one codegen unit: the layer spends its time
+# hashing, copying and looking up, and crosses crates to do it (from
+# myokex/victory-amd vi-fx3 c3723f3, the idea Key-rs's).
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+# Built often: without link-time optimization, as before.
+lto = false
+codegen-units = 16
