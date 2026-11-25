@@ -456,6 +456,7 @@ pub(crate) fn names(this: This) -> String {
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
+    crate::capture::note_drop(&why);
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
@@ -688,6 +689,20 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+
+/// Host pipelines made, and loaded from the library, since the start (the
+/// capture timeline).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pipeline_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
+/// Pipelines queued and not made yet (the capture timeline).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn queued() -> u64 {
+    make::waiting()
+}
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

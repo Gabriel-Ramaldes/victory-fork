@@ -248,6 +248,90 @@ pub(crate) fn save_read_back(
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }
+    timeline(frame);
+}
+
+/// Draws and dispatches dropped since the last saved frame, by why (as
+/// `frame-<n>-ops.txt` names it), for [`timeline`].
+static FRAME_DROPS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// A draw or dispatch was dropped for `why` (counted for the timeline).
+pub(crate) fn note_drop(why: &str) {
+    if folder().is_none() {
+        return;
+    }
+    let mut drops = FRAME_DROPS.lock().unwrap_or_else(|e| e.into_inner());
+    *drops.get_or_insert_with(Default::default).entry(why.to_owned()).or_default() += 1;
+}
+
+/// One line of `timeline.jsonl` per saved frame: when (since the start, and
+/// the wall clock to match the log), its picture, the draws run on the host
+/// and those dropped since the last saved frame by why, and what the caches
+/// had done so far (shaders from the shader cache or translated, pipelines
+/// loaded from the library or made, pipelines still queued).
+/// `victory timeline <folder> [log]` makes a page of
+/// it, with the run's log lines between the frames.
+fn timeline(frame: u64) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let Some(folder) = folder() else { return };
+    static LAST_DRAWN: AtomicU64 = AtomicU64::new(0);
+    let drawn = crate::draw::drawn();
+    let since = drawn.saturating_sub(LAST_DRAWN.swap(drawn, Relaxed));
+    let mut drops: Vec<(String, u64)> = FRAME_DROPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .into_iter()
+        .flatten()
+        .collect();
+    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let dropped: u64 = drops.iter().map(|d| d.1).sum();
+    let (cached, translated) = crate::shader_cache::counts();
+    let (made, loaded) = crate::pipeline::pipeline_counts();
+    let utc_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let world = WORLD.load(Relaxed);
+    let reasons: Vec<String> = drops
+        .iter()
+        .take(40)
+        .map(|(why, n)| format!("[{},{n}]", json_string(why)))
+        .collect();
+    let line = format!(
+        "{{\"frame\":{frame},\"t_ms\":{},\"utc_ms\":{utc_ms},\"png\":\"frame-{frame}.png\",\
+         \"world_frame\":{},\"drawn\":{since},\"dropped\":{dropped},\"drops\":[{}],\
+         \"shaders_cached\":{cached},\"shaders_translated\":{translated},\
+         \"pipelines_loaded\":{loaded},\"pipelines_made\":{made},\"pipelines_queued\":{}}}\n",
+        crate::host::now_ms(),
+        if world == u64::MAX { "null".to_owned() } else { frame.wrapping_sub(world).to_string() },
+        reasons.join(","),
+        crate::pipeline::queued(),
+    );
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(folder.join("timeline.jsonl"));
+    if let Ok(mut file) = file {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// `s` as a JSON string.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in

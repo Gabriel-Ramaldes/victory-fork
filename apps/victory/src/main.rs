@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+mod timeline;
 mod translate;
 
 use std::path::PathBuf;
@@ -111,6 +112,15 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// A page of what a run put on the screen: the frames a diagnostics
+    /// build saved (`VICTORY_CAPTURE`, `VICTORY_CAPTURE_WORLD=1`), with the
+    /// draws dropped by cause and the run's log lines between them.
+    Timeline {
+        /// The capture folder (it holds `timeline.jsonl`).
+        folder: PathBuf,
+        /// The run's log (its standard error), for the lines between frames.
+        log: Option<PathBuf>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -168,6 +178,7 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Timeline { folder, log } => timeline::run(&folder, log.as_deref()),
         Command::Config => show_config(),
     }
 }

@@ -3696,6 +3696,13 @@ impl Host {
     }
 }
 
+/// Milliseconds since the first call (the capture timeline).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 /// The window the title made, if it made one: of this process's visible
 /// top-level windows, the largest that is not a console's ([`pick_window`]).
 ///
