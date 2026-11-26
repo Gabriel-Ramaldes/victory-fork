@@ -576,6 +576,8 @@ impl Shadow {
             let mode = self.watched.load(Ordering::Relaxed);
             let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
+            #[cfg(feature = "diagnostics")]
+            let mut tally = crate::backread::Tally::new(1);
             let mut at = from;
             while at < to {
                 let n = (PAGE - (start + at) % PAGE).min(to - at);
@@ -583,7 +585,19 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                if unchanged.differs(start + at, host, old) {
+                #[cfg(feature = "diagnostics")]
+                let t0 = std::time::Instant::now();
+                let differs = unchanged.differs(start + at, host, old);
+                #[cfg(feature = "diagnostics")]
+                let t1 = if differs {
+                    tally.differ(n, t0)
+                } else {
+                    tally.same(n, t0);
+                    t0
+                };
+                #[cfg(feature = "diagnostics")]
+                let w0 = written;
+                if differs {
                     let buf = title.get_or_insert_with(|| {
                         let mut v = pooled(PAGE);
                         v.resize(PAGE, 0);
@@ -616,6 +630,10 @@ impl Shadow {
                         }
                         synced.push((start + at) / PAGE);
                     }
+                }
+                #[cfg(feature = "diagnostics")]
+                if differs {
+                    tally.rest(t1, written - w0);
                 }
                 at += n;
             }
@@ -1994,6 +2012,8 @@ impl Shadow {
         let start = self.start as usize;
         let mut written = 0;
         let mut title: Option<Vec<u8>> = None;
+        #[cfg(feature = "diagnostics")]
+        let mut tally = crate::backread::Tally::new(0);
         self.each_tile(s, address, address + len, |at, data, n| {
             let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
                 return;
@@ -2003,9 +2023,17 @@ impl Shadow {
             let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
             #[cfg(feature = "diagnostics")]
             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            let t0 = std::time::Instant::now();
             if host == old {
+                #[cfg(feature = "diagnostics")]
+                tally.same(n, t0);
                 return;
             }
+            #[cfg(feature = "diagnostics")]
+            let t1 = tally.differ(n, t0);
+            #[cfg(feature = "diagnostics")]
+            let w0 = written;
             #[cfg(feature = "diagnostics")]
             SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
             let buf = title.get_or_insert_with(|| {
@@ -2014,6 +2042,8 @@ impl Shadow {
                 v
             });
             if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+                #[cfg(feature = "diagnostics")]
+                tally.unread(t1);
                 return;
             }
             if let Some((dirty_start, dirty_end)) =
@@ -2030,6 +2060,8 @@ impl Shadow {
                 crate::backread::copied(at + dirty_start, dirty_len, crate::backread::Kind::Shadow, data as usize + dirty_start);
                 written += dirty_len;
             }
+            #[cfg(feature = "diagnostics")]
+            tally.rest(t1, written - w0);
         });
         if let Some(buf) = title {
             give_back(buf);

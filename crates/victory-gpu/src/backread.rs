@@ -806,6 +806,147 @@ pub(crate) fn stacks_text() -> String {
     text
 }
 
+/// Comparison of copies back, by path (0: sparse copies, 1: other host
+/// copies): what [`Tally`] adds up, in [`F`] fields.
+static CMP: [[AtomicU64; F]; 2] = [const { [const { AtomicU64::new(0) }; F] }; 2];
+/// Frames presented at the last [`compare_text`].
+static CMP_FRAMES: AtomicU64 = AtomicU64::new(0);
+const F: usize = 25;
+const CMP_CALLS: usize = 0;
+const TOTAL_NS: usize = 1;
+const SAME: usize = 2;
+const SAME_BYTES: usize = 3;
+const DIFF: usize = 4;
+const DIFF_BYTES: usize = 5;
+const CMP_NS: usize = 6;
+const REST_NS: usize = 7;
+const WRITTEN: usize = 8;
+const UNREAD: usize = 9;
+/// Tiles by size: <4 KiB, <16 KiB, <64 KiB, 64 KiB; identical, then
+/// different.
+const SAME_SIZE: usize = 10;
+const DIFF_SIZE: usize = 14;
+/// Different tiles by bytes written back: none, up to 64, 1 KiB, 4 KiB,
+/// 16 KiB, less than 64 KiB, 64 KiB.
+const SPAN: usize = 18;
+
+/// One copy-back call's comparisons, added up locally (no shared counter
+/// per tile) and added to [`CMP`] when dropped.
+pub(crate) struct Tally {
+    path: usize,
+    start: Instant,
+    n: [u64; F],
+}
+
+impl Tally {
+    pub(crate) fn new(path: usize) -> Self {
+        Self { path, start: Instant::now(), n: [0; F] }
+    }
+
+    fn size(n: usize) -> usize {
+        match n {
+            0..4096 => 0,
+            4096..16384 => 1,
+            16384..65536 => 2,
+            _ => 3,
+        }
+    }
+
+    /// A tile of `n` bytes compared identical (the comparison began at `t0`).
+    pub(crate) fn same(&mut self, n: usize, t0: Instant) {
+        self.n[CMP_NS] += t0.elapsed().as_nanos() as u64;
+        self.n[SAME] += 1;
+        self.n[SAME_BYTES] += n as u64;
+        self.n[SAME_SIZE + Self::size(n)] += 1;
+    }
+
+    /// A tile of `n` bytes compared different; returns when the comparison
+    /// ended (the rest of its work is timed from there).
+    pub(crate) fn differ(&mut self, n: usize, t0: Instant) -> Instant {
+        let t1 = Instant::now();
+        self.n[CMP_NS] += (t1 - t0).as_nanos() as u64;
+        self.n[DIFF] += 1;
+        self.n[DIFF_BYTES] += n as u64;
+        self.n[DIFF_SIZE + Self::size(n)] += 1;
+        t1
+    }
+
+    /// The different tile's title memory could not be read.
+    pub(crate) fn unread(&mut self, t1: Instant) {
+        self.n[REST_NS] += t1.elapsed().as_nanos() as u64;
+        self.n[UNREAD] += 1;
+    }
+
+    /// The different tile was read, merged and `written` bytes written back.
+    pub(crate) fn rest(&mut self, t1: Instant, written: usize) {
+        self.n[REST_NS] += t1.elapsed().as_nanos() as u64;
+        self.n[WRITTEN] += written as u64;
+        let span = match written {
+            0 => 0,
+            1..=64 => 1,
+            65..=1024 => 2,
+            1025..=4096 => 3,
+            4097..=16384 => 4,
+            16385..65536 => 5,
+            _ => 6,
+        };
+        self.n[SPAN + span] += 1;
+    }
+}
+
+impl Drop for Tally {
+    fn drop(&mut self) {
+        self.n[CMP_CALLS] = 1;
+        self.n[TOTAL_NS] = self.start.elapsed().as_nanos() as u64;
+        for (total, &n) in CMP[self.path].iter().zip(&self.n) {
+            if n != 0 {
+                total.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The comparison of copies back since the last call, per frame.
+pub(crate) fn compare_text() -> String {
+    let now = crate::queue::presented();
+    let frames = now.saturating_sub(CMP_FRAMES.swap(now, Ordering::Relaxed)).max(1) as f64;
+    let mut text = String::from("copy-back compare per frame:");
+    for (path, name) in ["sparse", "other copies"].iter().enumerate() {
+        let n: [u64; F] = CMP[path].each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+        if n[CMP_CALLS] == 0 {
+            continue;
+        }
+        let tiles = (n[SAME] + n[DIFF]).max(1) as f64;
+        let mb = |b: u64| b as f64 / 1e6 / frames;
+        let ms = |ns: u64| ns as f64 / 1e6 / frames;
+        text += &format!(
+            " {name}: {:.0} calls, {:.0} tiles, {:.1} MB compared; identical {:.0} tiles ({:.1}%, {:.1} MB), \
+             different {:.0} tiles ({:.1}%, {:.1} MB: an upper bound of the bytes changed); written back {:.1} MB, \
+             unread {}; tiles [<4K,<16K,<64K,64K] identical {:?} different {:?}; \
+             written per different tile [0,<=64,<=1K,<=4K,<=16K,<64K,64K] {:?}; \
+             thread ms: calls {:.1}, compare {:.1}, read+merge+write {:.1};",
+            n[CMP_CALLS] as f64 / frames,
+            tiles / frames,
+            mb(n[SAME_BYTES] + n[DIFF_BYTES]),
+            n[SAME] as f64 / frames,
+            100.0 * n[SAME] as f64 / tiles,
+            mb(n[SAME_BYTES]),
+            n[DIFF] as f64 / frames,
+            100.0 * n[DIFF] as f64 / tiles,
+            mb(n[DIFF_BYTES]),
+            mb(n[WRITTEN]),
+            n[UNREAD],
+            [0, 1, 2, 3].map(|i| (n[SAME_SIZE + i] as f64 / frames).round() as u64),
+            [0, 1, 2, 3].map(|i| (n[DIFF_SIZE + i] as f64 / frames).round() as u64),
+            [0, 1, 2, 3, 4, 5, 6].map(|i| (n[SPAN + i] as f64 / frames).round() as u64),
+            ms(n[TOTAL_NS]),
+            ms(n[CMP_NS]),
+            ms(n[REST_NS]),
+        );
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +997,23 @@ mod tests {
         copied(at + PAGE, 0x40, Kind::Shadow, host);
         retaken(at + PAGE, 0x40, (host + 0x1000) as *const u8);
         assert!(get(1) >= before[1] + 0x40);
+    }
+
+    /// A call's comparisons reach the shared counters once, when dropped.
+    #[test]
+    fn a_tally_adds_up_its_tiles_when_dropped() {
+        let get = |i: usize| CMP[0][i].load(Ordering::Relaxed);
+        let before = [get(SAME), get(DIFF), get(WRITTEN), get(SAME_SIZE + 3), get(DIFF_SIZE), get(SPAN + 2)];
+        {
+            let mut tally = Tally::new(0);
+            tally.same(PAGE, Instant::now());
+            let t1 = tally.differ(100, Instant::now());
+            tally.rest(t1, 80);
+            assert_eq!(get(SAME), before[0]);
+        }
+        assert!(get(SAME) > before[0] && get(DIFF) > before[1]);
+        assert!(get(WRITTEN) >= before[2] + 80);
+        assert!(get(SAME_SIZE + 3) > before[3] && get(DIFF_SIZE) > before[4] && get(SPAN + 2) > before[5]);
     }
 
     fn n_ours() -> u64 {

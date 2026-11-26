@@ -3467,6 +3467,8 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             tracing::info!("back reads: {}", crate::backread::report_text());
             #[cfg(feature = "diagnostics")]
+            tracing::info!("{}", crate::backread::compare_text());
+            #[cfg(feature = "diagnostics")]
             {
                 let stacks = crate::backread::stacks_text();
                 if !stacks.is_empty() {
