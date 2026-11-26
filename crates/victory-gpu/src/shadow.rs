@@ -484,6 +484,10 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        if crate::writeaudit::write_on() {
+            crate::writeaudit::declared(address as usize, len as usize);
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2034,6 +2038,14 @@ impl Shadow {
             tally.compared(began);
             found.into_iter()
         });
+        // Diagnostics (`VICTORY_WRITE_AUDIT`, `crate::writeaudit`): what the
+        // loop compares, counted as it goes.
+        #[cfg(feature = "diagnostics")]
+        let audit = crate::writeaudit::write_on();
+        #[cfg(feature = "diagnostics")]
+        let mut audit_tiles: Vec<u32> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut audit_differ, mut audit_examined, mut audit_written) = (0u64, 0u64, 0u64);
         self.each_tile(s, address, address + len, |at, data, n| {
             let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
                 return;
@@ -2062,6 +2074,12 @@ impl Shadow {
             };
             #[cfg(not(feature = "diagnostics"))]
             let same = host == old;
+            #[cfg(feature = "diagnostics")]
+            if audit {
+                audit_tiles.push(((at - start) / PAGE) as u32);
+                audit_examined += n as u64;
+                audit_differ += u64::from(!same);
+            }
             if same {
                 #[cfg(feature = "diagnostics")]
                 tally.same(n, t0);
@@ -2095,11 +2113,27 @@ impl Shadow {
                 );
                 #[cfg(feature = "diagnostics")]
                 crate::backread::copied(at + dirty_start, dirty_len, crate::backread::Kind::Shadow, data as usize + dirty_start);
+                #[cfg(feature = "diagnostics")]
+                if audit {
+                    audit_written += dirty_len as u64;
+                }
                 written += dirty_len;
             }
             #[cfg(feature = "diagnostics")]
             tally.rest(t1, written - w0);
         });
+        #[cfg(feature = "diagnostics")]
+        if audit {
+            crate::writeaudit::back(
+                std::ptr::from_ref(self) as usize,
+                address,
+                len,
+                &audit_tiles,
+                audit_differ,
+                audit_examined,
+                audit_written,
+            );
+        }
         if let Some(buf) = title {
             give_back(buf);
         }

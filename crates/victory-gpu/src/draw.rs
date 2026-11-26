@@ -213,6 +213,10 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     if kind != 0 || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         if kind == 2 {
+            #[cfg(feature = "diagnostics")]
+            if crate::writeaudit::write_on() {
+                crate::writeaudit::resource(2, 0);
+            }
             shadow.gpu_writes(list, address, len);
         }
         return Some(gpu);
@@ -709,6 +713,10 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::writeaudit::write_on() {
+            crate::writeaudit::bound(p);
+        }
         self.null_uav = false;
         let l = &list.list;
         let by_address = p.stages.iter().any(|s| {
@@ -1901,6 +1909,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
+            #[cfg(feature = "diagnostics")]
+            if crate::writeaudit::write_on() {
+                crate::writeaudit::resource(1, u.lower_bound);
+            }
             shadow.gpu_writes(list, address, len);
         }
     }

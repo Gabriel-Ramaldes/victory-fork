@@ -21,6 +21,8 @@ mod backread;
 mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod tilecmp;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod writeaudit;
 #[cfg(windows)]
 mod card;
 pub mod console;

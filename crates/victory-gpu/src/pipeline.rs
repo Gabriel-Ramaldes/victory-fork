@@ -332,6 +332,42 @@ fn writes_memory(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Diagnostics (`crate::writeaudit`): what the console code of `shader`
+/// does to memory, as [`writes_memory`] decodes it: (stores, atomics, code
+/// not all known).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn memory_ops(shader: &Shader) -> (bool, bool, bool) {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(c) = victory_shader::Container::parse(&shader.container) else {
+        return (false, false, true);
+    };
+    let programs = victory_shader::container_programs(&c).unwrap_or_default();
+    if programs.is_empty() {
+        return (false, false, true);
+    }
+    let (mut st, mut at, mut unknown) = (false, false, false);
+    for program in &programs {
+        let Ok(code) = decode(&program.code) else {
+            unknown = true;
+            continue;
+        };
+        for i in &code {
+            let name = i.name();
+            match i.encoding {
+                Encoding::Mubuf | Encoding::Mtbuf | Encoding::Mimg | Encoding::Flat | Encoding::Global => match name {
+                    None => unknown = true,
+                    Some(n) if n.contains("atomic") => at = true,
+                    Some(n) if n.contains("store") => st = true,
+                    Some(_) => {}
+                },
+                Encoding::Sop1 if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) => unknown = true,
+                _ => {}
+            }
+        }
+    }
+    (st, at, unknown)
+}
+
 /// Whether a memory instruction (by name) writes memory.
 #[cfg(windows)]
 fn stores(name: &str) -> bool {

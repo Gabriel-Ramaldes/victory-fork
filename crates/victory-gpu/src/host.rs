@@ -1462,6 +1462,12 @@ impl Host {
                 });
             }
         }
+        // Diagnostics (`VICTORY_WRITE_AUDIT`): tiles compared again within
+        // one submission are counted per submission.
+        #[cfg(feature = "diagnostics")]
+        if crate::writeaudit::write_on() {
+            crate::writeaudit::submission_done();
+        }
         for list in runs {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
@@ -2795,7 +2801,15 @@ impl Batch {
                             add(C::Refreshes, 1);
                             add(C::RefreshBytes, *len as u64);
                         }
+                        // Diagnostics (`VICTORY_STRETCH_AUDIT`): timed only
+                        // when the audit is on.
+                        #[cfg(feature = "diagnostics")]
+                        let audit = crate::writeaudit::stretch_on().then(std::time::Instant::now);
                         let n = shadow.update_lazily(*address, *len, all);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(t) = audit {
+                            crate::writeaudit::refreshed(*address, *len, n, t.elapsed().as_micros() as u64);
+                        }
                         copied.fetch_add(n as u64, Ordering::Relaxed);
                     }
                 });
@@ -2948,6 +2962,11 @@ fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
     let us = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     crate::copystat::range(from, len, us, 0);
+    // Diagnostics (`VICTORY_STRETCH_AUDIT`): which ranges are re-copied.
+    #[cfg(feature = "diagnostics")]
+    if crate::writeaudit::stretch_on() {
+        crate::writeaudit::refreshed(from, len, copied, us);
+    }
     PREPARING[0].fetch_add(us, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
 }
@@ -3502,6 +3521,8 @@ impl Meter {
                 );
                 crate::texture::flips::log();
                 crate::copystat::log(frames);
+                // `VICTORY_STRETCH_AUDIT`, `VICTORY_WRITE_AUDIT`; nothing when off.
+                crate::writeaudit::report();
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

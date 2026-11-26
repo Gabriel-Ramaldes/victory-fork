@@ -309,6 +309,109 @@ pub(crate) fn aliases(at: usize) -> Vec<usize> {
     views.as_ref().map_or(Vec::new(), |v| v.shown(at - at % BLOCK).to_vec())
 }
 
+/// Diagnostics (`crate::writeaudit`, `VICTORY_STRETCH_AUDIT`): how
+/// `[at, at + len)` is made of the views the runtime was told of. Reads the
+/// views only.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct AuditLayout {
+    /// Views overlapping the range.
+    pub(crate) views: usize,
+    /// The range's first byte is in memory of a section (`MEM_MAPPED`).
+    pub(crate) mapped: bool,
+    /// Bytes of the range inside views, and between them.
+    pub(crate) covered: usize,
+    pub(crate) gaps: usize,
+    /// Distinct sections; runs of views that follow one another in address
+    /// and in their section's offsets.
+    pub(crate) sections: usize,
+    pub(crate) runs: usize,
+    pub(crate) section: usize,
+    pub(crate) first_view: usize,
+    pub(crate) first_len: usize,
+    pub(crate) first_offset: u64,
+    pub(crate) last_view: usize,
+    pub(crate) last_len: usize,
+    /// Blocks of the range whose page is shown at other addresses too, and
+    /// those addresses.
+    pub(crate) aliased_blocks: usize,
+    pub(crate) alias_addresses: usize,
+    /// `VirtualQuery`'s allocation base is the same at both ends.
+    pub(crate) same_base: bool,
+    /// Each view: address, length, section, offset, whether it follows the
+    /// one before in address and section, other addresses of its first block.
+    pub(crate) list: Vec<(usize, usize, usize, u64, bool, usize)>,
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn audit_layout(at: usize, len: usize) -> AuditLayout {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |a: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(a as *const _, &mut info, size_of_val(&info)) };
+        info
+    };
+    let (first, last) = (query(at), query(at + len.max(1) - 1));
+    let mut out = AuditLayout {
+        mapped: first.Type == MEM_MAPPED,
+        same_base: first.AllocationBase == last.AllocationBase,
+        ..Default::default()
+    };
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(views) = views.as_ref() else { return out };
+    let end = at.saturating_add(len);
+    let from = views
+        .by_addr
+        .range(..=at)
+        .next_back()
+        .filter(|(a, (n, _, _))| *a + n > at)
+        .map_or(at, |(a, _)| *a);
+    let mut sections = std::collections::BTreeSet::new();
+    let mut before: Option<(usize, usize, u64)> = None;
+    let mut cursor = at;
+    let mut aliases = std::collections::BTreeSet::new();
+    for (&a, &(n, section, offset)) in views.by_addr.range(from..end) {
+        let follows = before.is_some_and(|(e, s, o)| e == a && s == section && o == offset);
+        if !follows {
+            out.runs += 1;
+        }
+        if out.views == 0 {
+            (out.first_view, out.first_len, out.first_offset, out.section) = (a, n, offset, section);
+        }
+        (out.last_view, out.last_len) = (a, n);
+        out.views += 1;
+        sections.insert(section);
+        let (lo, hi) = (a.max(at), (a + n).min(end));
+        if lo > cursor {
+            out.gaps += lo - cursor;
+        }
+        out.covered += hi.saturating_sub(lo);
+        cursor = cursor.max(hi);
+        let mut others_first = 0;
+        for k in 0..n / BLOCK {
+            let block = a + k * BLOCK;
+            if block < at || block >= end {
+                continue;
+            }
+            let shown = views.shown(block);
+            if shown.len() > 1 {
+                out.aliased_blocks += 1;
+                aliases.extend(shown.iter().copied().filter(|&x| x != block));
+            }
+            if k == 0 {
+                others_first = shown.len().saturating_sub(1);
+            }
+        }
+        out.list.push((a, n, section, offset, follows, others_first));
+        before = Some((a + n, section, offset + n as u64));
+    }
+    out.sections = sections.len();
+    out.alias_addresses = aliases.len();
+    out
+}
+
 /// The runtime mapped a view at `[at, at + len)` of the bytes from `offset`
 /// on of the physical-page section `section`. The view is writable, so the
 /// same pages guarded at another view are opened: their copies check them
