@@ -12,8 +12,17 @@
 //! exception; our handler notes who touched it (title code, our code, or a
 //! system DLL called by either), read or write, and after how many frames
 //! and microseconds, takes the guard off the block's other pages, and lets
-//! the access run. Blocks not touched within [`HORIZON`] frames are counted
-//! as such and given back. At most [`SLOTS`] blocks are followed at once.
+//! the access run. A title access ends the following; after one of ours
+//! (or a write announced to `watch::writing`, which kernel writes need) the
+//! guards come back [`REARM_US`] later, so title accesses after ours are
+//! seen too. Blocks followed for [`HORIZON`] frames are counted (untouched,
+//! or touched by us only) and given back. At most [`SLOTS`] blocks are
+//! followed at once.
+//!
+//! Always too: bytes host copies take again from title memory, split by
+//! whether the same copy had just copied the block back (the echo of our
+//! own write), another had, or none; with the variable set, sampled echo
+//! blocks are compared with the copy first (bytes that differ).
 //!
 //! What this cannot see: GPU reads of title memory used in place; kernel
 //! accesses (a system call touching a guarded page fails once and clears
@@ -21,7 +30,7 @@
 //! address of the page the runtime did not tell us of; anything finer than
 //! a 64 KiB block (the copy-back and write-watch granularity).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -58,14 +67,26 @@ const FREE: u8 = 0;
 const ARMING: u8 = 1;
 const ARMED: u8 = 2;
 const CLAIMED: u8 = 3;
+/// Touched by us (or a write announced): guards off, put back by [`rearm_due`].
+const PENDING: u8 = 4;
+/// Time a block touched by us stays without guards before [`rearm_due`]
+/// puts them back (our copy of it has ended by then).
+const REARM_US: u64 = 2_000;
 
 struct Slot {
     state: AtomicU8,
     kind: AtomicU8,
     block: AtomicU64,
     aliases: [AtomicU64; ALIASES],
+    /// Frame of the first arming (for the horizon).
     frame: AtomicU64,
+    /// Frame and time of the last copy back into it.
+    last_frame: AtomicU64,
     us: AtomicU64,
+    /// Accesses by us (and announced writes) so far, and when the last one
+    /// took the guards off.
+    touches: AtomicU64,
+    pending_us: AtomicU64,
 }
 
 static SLOT: [Slot; SLOTS] = [const {
@@ -75,7 +96,10 @@ static SLOT: [Slot; SLOTS] = [const {
         block: AtomicU64::new(0),
         aliases: [const { AtomicU64::new(0) }; ALIASES],
         frame: AtomicU64::new(0),
+        last_frame: AtomicU64::new(0),
         us: AtomicU64::new(0),
+        touches: AtomicU64::new(0),
+        pending_us: AtomicU64::new(0),
     }
 }; SLOTS];
 
@@ -117,6 +141,27 @@ static LOST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 static ARMED_N: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 /// Not followed: slots full, more aliases than followed, not guardable.
 static SKIPPED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Title accesses at any time within the horizon, by [`Kind`] x (read,
+/// write), and those of them after one of ours.
+static TITLE_ANY: [[AtomicU64; 2]; KINDS] = [const { [const { AtomicU64::new(0) }; 2] }; KINDS];
+static TITLE_AFTER_OURS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+/// Followed to the horizon with accesses by us only (none by the title).
+static EXPIRED_OURS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+/// Guards put back after an access of ours; guards taken off before a
+/// write announced to `watch::writing` (our copies, the title's I/O).
+static REARMS: AtomicU64 = AtomicU64::new(0);
+static ANNOUNCED: AtomicU64 = AtomicU64::new(0);
+static LAST_REARM: AtomicU64 = AtomicU64::new(0);
+/// Blocks copied back and not taken again since, with the host copy's
+/// address of the block (usize::MAX: none, a readback or a texture).
+static BACKED: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
+/// Bytes host copies took again from title memory since the last report:
+/// blocks the same copy had just copied back (echo), blocks another copy
+/// or a readback had (other), the rest.
+static RETAKEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Echo bytes compared with what the copy holds (sampled blocks), and those
+/// that differed.
+static ECHO_DIFF: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Faults on blocks no longer followed.
 static LATE: AtomicU64 = AtomicU64::new(0);
 /// Microseconds spent guarding and in the handler (the measurement's own
@@ -149,8 +194,9 @@ fn start() -> &'static Instant {
     START.get_or_init(Instant::now)
 }
 
-/// `len` bytes at `at` of title memory were just copied back from the GPU.
-pub(crate) fn copied(at: usize, len: usize, kind: Kind) {
+/// `len` bytes at `at` of title memory were just copied back from the GPU;
+/// `host` is where they are in the host copy they came from (0 if none).
+pub(crate) fn copied(at: usize, len: usize, kind: Kind, host: usize) {
     if len == 0 {
         return;
     }
@@ -167,10 +213,19 @@ pub(crate) fn copied(at: usize, len: usize, kind: Kind) {
         let mut set = RUN_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(HashSet::new).extend(first..last);
     }
+    {
+        let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
+        let backed = backed.get_or_insert_with(HashMap::new);
+        for block in first..last {
+            let base = if host == 0 { usize::MAX } else { host.wrapping_add(block as usize * PAGE).wrapping_sub(at) };
+            backed.insert(block, base);
+        }
+    }
     let n = rate();
     if n == 0 {
         return;
     }
+    rearm_due();
     for block in first..last {
         if (block.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % n == 0 {
             arm(block, kind);
@@ -183,7 +238,10 @@ fn arm(block: u64, kind: Kind) {
     let started = Instant::now();
     ranges();
     install();
-    if SLOT.iter().any(|s| s.block.load(Ordering::Acquire) == block && s.state.load(Ordering::Acquire) != FREE) {
+    if let Some(s) = SLOT.iter().find(|s| s.block.load(Ordering::Acquire) == block && s.state.load(Ordering::Acquire) != FREE) {
+        // Followed already: the title's next access is timed from this copy.
+        s.last_frame.store(crate::queue::presented(), Ordering::Relaxed);
+        s.us.store(start().elapsed().as_micros() as u64, Ordering::Relaxed);
         return;
     }
     let aliases: Vec<u64> = crate::watch::aliases(block as usize * PAGE)
@@ -217,7 +275,9 @@ fn arm(block: u64, kind: Kind) {
     }
     slot.kind.store(kind as u8, Ordering::Relaxed);
     slot.frame.store(crate::queue::presented(), Ordering::Relaxed);
+    slot.last_frame.store(crate::queue::presented(), Ordering::Relaxed);
     slot.us.store(start().elapsed().as_micros() as u64, Ordering::Relaxed);
+    slot.touches.store(0, Ordering::Relaxed);
     let mut guarded = false;
     for b in std::iter::once(block).chain(aliases.iter().copied()) {
         guarded |= guard(b);
@@ -404,7 +464,10 @@ fn install() {
                 let stack = walk(unsafe { &*(*info).ContextRecord });
                 let who = who(&stack);
                 let k = usize::from(s.kind.load(Ordering::Relaxed));
-                FIRST[k][who as usize][write].fetch_add(1, Ordering::Relaxed);
+                let touches = s.touches.load(Ordering::Relaxed);
+                if touches == 0 {
+                    FIRST[k][who as usize][write].fetch_add(1, Ordering::Relaxed);
+                }
                 if !matches!(who, Who::Title)
                     && let Ok(mut stacks) = STACKS.try_lock()
                 {
@@ -415,8 +478,17 @@ fn install() {
                         stacks.push((stack, 1));
                     }
                 }
-                {
-                    let frames = crate::queue::presented().saturating_sub(s.frame.load(Ordering::Relaxed));
+                let title = matches!(who, Who::Title);
+                if title {
+                    TITLE_ANY[k][write].fetch_add(1, Ordering::Relaxed);
+                    if touches > 0 {
+                        TITLE_AFTER_OURS[k].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // Timed from the last copy back: the first access of all, and
+                // every title access.
+                if touches == 0 || title {
+                    let frames = crate::queue::presented().saturating_sub(s.last_frame.load(Ordering::Relaxed));
                     let f = match frames {
                         0 => 0,
                         1 => 1,
@@ -425,8 +497,8 @@ fn install() {
                         _ => 4,
                     };
                     AFTER_FRAMES[k][who as usize][f].fetch_add(1, Ordering::Relaxed);
-                    let us = start().elapsed().as_micros() as u64 - s.us.load(Ordering::Relaxed).min(start().elapsed().as_micros() as u64);
-                    let t = match us {
+                    let now = start().elapsed().as_micros() as u64;
+                    let t = match now.saturating_sub(s.us.load(Ordering::Relaxed)) {
                         0..1_000 => 0,
                         1_000..10_000 => 1,
                         10_000..100_000 => 2,
@@ -440,7 +512,15 @@ fn install() {
                 {
                     unguard(b);
                 }
-                free(s);
+                if title {
+                    free(s);
+                } else {
+                    // Ours: followed on, its guards put back once our access
+                    // has ended.
+                    s.touches.fetch_add(1, Ordering::Relaxed);
+                    s.pending_us.store(start().elapsed().as_micros() as u64, Ordering::Relaxed);
+                    s.state.store(PENDING, Ordering::Release);
+                }
                 true
             }
             _ => {
@@ -470,15 +550,16 @@ fn install() {
     });
 }
 
-/// Gives back blocks followed for more than [`HORIZON`] frames (counted as
-/// untouched, or lost if their guard is gone).
+/// Gives back blocks followed for more than [`HORIZON`] frames: untouched
+/// (or lost if their guard is gone), or touched by us only.
 fn sweep() {
     let now = crate::queue::presented();
     for s in &SLOT {
-        if s.state.load(Ordering::Acquire) != ARMED || now.saturating_sub(s.frame.load(Ordering::Relaxed)) <= HORIZON {
+        let st = s.state.load(Ordering::Acquire);
+        if !(st == ARMED || st == PENDING) || now.saturating_sub(s.frame.load(Ordering::Relaxed)) <= HORIZON {
             continue;
         }
-        if s.state.compare_exchange(ARMED, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        if s.state.compare_exchange(st, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             continue;
         }
         let k = usize::from(s.kind.load(Ordering::Relaxed));
@@ -488,12 +569,130 @@ fn sweep() {
         {
             any |= unguard(b);
         }
-        if any {
+        if s.touches.load(Ordering::Relaxed) > 0 {
+            EXPIRED_OURS[k].fetch_add(1, Ordering::Relaxed);
+        } else if any {
             EXPIRED[k].fetch_add(1, Ordering::Relaxed);
         } else {
             LOST[k].fetch_add(1, Ordering::Relaxed);
         }
         free(s);
+    }
+}
+
+/// Puts the guards back on blocks touched by us at least [`REARM_US`] ago
+/// (looked at no more than once a millisecond).
+fn rearm_due() {
+    let now = start().elapsed().as_micros() as u64;
+    let last = LAST_REARM.load(Ordering::Relaxed);
+    if now < last + 1_000 || LAST_REARM.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    for s in &SLOT {
+        if s.state.load(Ordering::Acquire) != PENDING || now < s.pending_us.load(Ordering::Relaxed) + REARM_US {
+            continue;
+        }
+        if s.state.compare_exchange(PENDING, ARMING, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            continue;
+        }
+        let started = Instant::now();
+        let mut guarded = false;
+        for b in std::iter::once(s.block.load(Ordering::Acquire))
+            .chain(s.aliases.iter().map(|a| a.load(Ordering::Acquire)).filter(|&a| a != 0))
+        {
+            guarded |= guard(b);
+        }
+        if guarded {
+            REARMS.fetch_add(1, Ordering::Relaxed);
+            // A fault while arming already claimed it: leave it as it is.
+            let _ = s.state.compare_exchange(ARMING, ARMED, Ordering::AcqRel, Ordering::Relaxed);
+        } else if s.state.compare_exchange(ARMING, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            let k = usize::from(s.kind.load(Ordering::Relaxed));
+            EXPIRED_OURS[k].fetch_add(1, Ordering::Relaxed);
+            free(s);
+        }
+        COST_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// A write into title memory `[at, at + len)` is announced (`watch::writing`:
+/// our copies back, our kernel copies, the title's file and DirectStorage
+/// reads): followed blocks there lose their guards first, or a kernel write
+/// would fail on them. Counted as a touch by us; the guards come back later.
+pub(crate) fn announced(at: usize, len: usize) {
+    if rate() == 0 || len == 0 {
+        return;
+    }
+    let (first, last) = ((at / PAGE) as u64, (at + len).div_ceil(PAGE) as u64);
+    for s in &SLOT {
+        if s.state.load(Ordering::Acquire) != ARMED {
+            continue;
+        }
+        let blocks = || {
+            std::iter::once(s.block.load(Ordering::Acquire))
+                .chain(s.aliases.iter().map(|a| a.load(Ordering::Acquire)).filter(|&a| a != 0))
+        };
+        if !blocks().any(|b| (first..last).contains(&b)) {
+            continue;
+        }
+        if s.state.compare_exchange(ARMED, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            continue;
+        }
+        for b in blocks() {
+            unguard(b);
+        }
+        ANNOUNCED.fetch_add(1, Ordering::Relaxed);
+        s.touches.fetch_add(1, Ordering::Relaxed);
+        s.pending_us.store(start().elapsed().as_micros() as u64, Ordering::Relaxed);
+        s.state.store(PENDING, Ordering::Release);
+    }
+}
+
+/// A host copy takes `[at, at + len)` of title memory again, into `host`.
+/// Counts the bytes by whether the block was just copied back from that
+/// same place (an echo), from elsewhere, or not; for sampled echo blocks
+/// (`VICTORY_BACK_READS`), compares title memory with what the copy holds.
+pub(crate) fn retaken(at: usize, len: usize, host: *const u8) {
+    if len == 0 {
+        return;
+    }
+    let n = rate();
+    let (first, last) = ((at / PAGE) as u64, (at + len).div_ceil(PAGE) as u64);
+    let mut compare = Vec::new();
+    {
+        let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
+        let backed = backed.get_or_insert_with(HashMap::new);
+        for block in first..last {
+            let lo = (block as usize * PAGE).max(at);
+            let hi = ((block as usize + 1) * PAGE).min(at + len);
+            let bytes = (hi - lo) as u64;
+            let here = (host as usize).wrapping_add(block as usize * PAGE).wrapping_sub(at);
+            match backed.remove(&block) {
+                Some(base) if base == here => {
+                    RETAKEN[0].fetch_add(bytes, Ordering::Relaxed);
+                    if n > 0 && (block.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % n == 0 {
+                        compare.push((lo, hi));
+                    }
+                }
+                Some(_) => {
+                    RETAKEN[1].fetch_add(bytes, Ordering::Relaxed);
+                }
+                None => {
+                    RETAKEN[2].fetch_add(bytes, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    for (lo, hi) in compare {
+        let mut title = vec![0u8; hi - lo];
+        if !crate::host::read_into(lo as *const u8, &mut title) {
+            continue;
+        }
+        // SAFETY: the host copy's bytes for `[lo, hi)`, inside `[at, at + len)`.
+        let held = unsafe { std::slice::from_raw_parts(host.add(lo - at), hi - lo) };
+        let differ = title.iter().zip(held).filter(|(a, b)| a != b).count();
+        ECHO_DIFF[0].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+        ECHO_DIFF[1].fetch_add(differ as u64, Ordering::Relaxed);
     }
 }
 
@@ -508,6 +707,13 @@ pub(crate) fn report_text() -> String {
         let blocks = BLOCKS[k].lock().unwrap_or_else(|e| e.into_inner()).take().map_or(0, |s| s.len());
         text += &format!("{name} back since: {:.1} MB in {calls} writes, {blocks} blocks of 64 KiB; ", bytes as f64 / 1e6);
     }
+    let mb = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / 1e6;
+    text += &format!(
+        "taken again since: echo {:.1} MB, copied back by another {:.1} MB, other {:.1} MB; ",
+        mb(&RETAKEN[0]),
+        mb(&RETAKEN[1]),
+        mb(&RETAKEN[2]),
+    );
     if rate() == 0 {
         if !SAID.swap(true, Ordering::Relaxed) {
             text += "(VICTORY_BACK_READS=<n> follows their first CPU access)";
@@ -515,7 +721,8 @@ pub(crate) fn report_text() -> String {
         return text;
     }
     sweep();
-    let pending = SLOT.iter().filter(|s| s.state.load(Ordering::Relaxed) == ARMED).count();
+    rearm_due();
+    let pending = SLOT.iter().filter(|s| matches!(s.state.load(Ordering::Relaxed), ARMED | PENDING)).count();
     let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
     for (k, name) in NAMES.iter().enumerate() {
         if n(&ARMED_N[k]) == 0 {
@@ -533,6 +740,13 @@ pub(crate) fn report_text() -> String {
             n(&EXPIRED[k]),
             n(&LOST[k]),
         );
+        text += &format!(
+            "title any time read {} write {} (after ours {}); to the horizon with ours only {}; ",
+            n(&TITLE_ANY[k][0]),
+            n(&TITLE_ANY[k][1]),
+            n(&TITLE_AFTER_OURS[k]),
+            n(&EXPIRED_OURS[k]),
+        );
         for (w, who) in ["title", "ours", "system"].iter().enumerate() {
             if f(w, 0) + f(w, 1) == 0 {
                 continue;
@@ -546,7 +760,8 @@ pub(crate) fn report_text() -> String {
     }
     let distinct = |set: &Mutex<Option<HashSet<u64>>>| set.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashSet::len);
     text += &format!(
-        "followed now {pending}; distinct blocks copied back {} followed {}; other addresses [0,1,2-3,4-7,8-15,16+] {:?};          not followed: slots full {}, many views {}, not guardable {}; late faults {}; cost {:.1} ms in {} faults so far",
+        "followed now {pending}; distinct blocks copied back {} followed {}; other addresses [0,1,2-3,4-7,8-15,16+] {:?};          not followed: slots full {}, many views {}, not guardable {}; late faults {}; rearmed {}, announced writes {}; echo compared {:.1} MB, differing {} bytes; \
+         cost {:.1} ms in {} faults so far",
         distinct(&RUN_BLOCKS),
         distinct(&RUN_FOLLOWED),
         ALIAS_COUNTS.each_ref().map(n),
@@ -554,6 +769,10 @@ pub(crate) fn report_text() -> String {
         n(&SKIPPED[1]),
         n(&SKIPPED[2]),
         n(&LATE),
+        n(&REARMS),
+        n(&ANNOUNCED),
+        n(&ECHO_DIFF[0]) as f64 / 1e6,
+        n(&ECHO_DIFF[1]),
         n(&COST_US) as f64 / 1e3,
         n(&FAULTS),
     );
@@ -617,6 +836,26 @@ mod tests {
         assert!((at..at + PAGE).step_by(KERNEL_PAGE).all(|p| query(p).is_some_and(|(_, pr)| pr & PAGE_GUARD == 0)));
         // SAFETY: our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Taken again into the copy it came back from: an echo, once; from
+    /// another place: copied back by another; never copied back: other.
+    /// (Addresses only: nothing is read without `VICTORY_BACK_READS`.)
+    #[test]
+    fn bytes_taken_again_are_told_apart_by_where_they_came_back_from() {
+        let at = 0x7123_4500_0000usize + 0x100;
+        let host = 0x5000_0000usize;
+        let get = |i: usize| RETAKEN[i].load(Ordering::Relaxed);
+        let before = [get(0), get(1), get(2)];
+        copied(at, 0x200, Kind::Shadow, host);
+        retaken(at, 0x200, host as *const u8);
+        assert!(get(0) >= before[0] + 0x200);
+        // Its echo is counted once.
+        retaken(at, 0x200, host as *const u8);
+        assert!(get(2) >= before[2] + 0x200);
+        copied(at + PAGE, 0x40, Kind::Shadow, host);
+        retaken(at + PAGE, 0x40, (host + 0x1000) as *const u8);
+        assert!(get(1) >= before[1] + 0x40);
     }
 
     fn n_ours() -> u64 {

@@ -1469,7 +1469,7 @@ impl Host {
                     crate::watch::writing(rb.dst, bytes);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, bytes);
                     #[cfg(feature = "diagnostics")]
-                    crate::backread::copied(rb.dst, bytes, crate::backread::Kind::Readback);
+                    crate::backread::copied(rb.dst, bytes, crate::backread::Kind::Readback, 0);
                     bytes
                 } else {
                     let mut n = 0;
@@ -1479,7 +1479,7 @@ impl Host {
                         crate::watch::writing(to, rb.row_bytes);
                         write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
                         #[cfg(feature = "diagnostics")]
-                        crate::backread::copied(to, rb.row_bytes, crate::backread::Kind::Readback);
+                        crate::backread::copied(to, rb.row_bytes, crate::backread::Kind::Readback, 0);
                         n += rb.row_bytes;
                     }
                     n

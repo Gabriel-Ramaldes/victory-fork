@@ -349,7 +349,7 @@ impl Shadow {
                         dirty_len,
                     );
                     #[cfg(feature = "diagnostics")]
-                    crate::backread::copied(title_addr + dirty_start, dirty_len, crate::backread::Kind::Shadow);
+                    crate::backread::copied(title_addr + dirty_start, dirty_len, crate::backread::Kind::Shadow, 0);
                     written += dirty_len;
                 }
                 if cpu_modified {
@@ -606,7 +606,12 @@ impl Shadow {
                                 dirty_len,
                             );
                             #[cfg(feature = "diagnostics")]
-                            crate::backread::copied(start + at + dirty_start, dirty_len, crate::backread::Kind::Shadow);
+                            crate::backread::copied(
+                                start + at + dirty_start,
+                                dirty_len,
+                                crate::backread::Kind::Shadow,
+                                host.as_ptr() as usize + dirty_start,
+                            );
                             written += dirty_len;
                         }
                         synced.push((start + at) / PAGE);
@@ -949,12 +954,16 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         if let Some(s) = &self.sparse {
             self.each_tile(s, from, to, |at, data, n| {
+                #[cfg(feature = "diagnostics")]
+                crate::backread::retaken(at, n, data);
                 crate::host::copy_mapped(data, at as *const u8, n, false);
             });
             return to - from;
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        crate::backread::retaken(from, to - from, at);
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         if let Some(card) = &self.card {
             card.mark_dirty(from - start, to - start);
@@ -2018,7 +2027,7 @@ impl Shadow {
                     dirty_len,
                 );
                 #[cfg(feature = "diagnostics")]
-                crate::backread::copied(at + dirty_start, dirty_len, crate::backread::Kind::Shadow);
+                crate::backread::copied(at + dirty_start, dirty_len, crate::backread::Kind::Shadow, data as usize + dirty_start);
                 written += dirty_len;
             }
         });

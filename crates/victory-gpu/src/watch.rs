@@ -641,6 +641,8 @@ pub fn writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::backread::announced(at, len);
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
     let until = std::time::Instant::now() + PIN;

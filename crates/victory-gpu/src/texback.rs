@@ -152,5 +152,5 @@ pub(crate) fn land(back: &Back) {
     unsafe { back.buffer.Unmap(0, None) };
     crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
     #[cfg(feature = "diagnostics")]
-    crate::backread::copied(back.at, back.size, crate::backread::Kind::Texture);
+    crate::backread::copied(back.at, back.size, crate::backread::Kind::Texture, 0);
 }
