@@ -495,6 +495,28 @@ impl Host {
     }
 }
 
+/// An auto-reset event of the calling thread's own for [`Host::wait_fence`],
+/// made on first use and closed when the thread ends; `None` if it could not
+/// be made.
+fn own_event() -> Option<HANDLE> {
+    struct Own(Option<HANDLE>);
+    impl Drop for Own {
+        fn drop(&mut self) {
+            if let Some(event) = self.0 {
+                // SAFETY: an event this thread made and nothing else holds.
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
+            }
+        }
+    }
+    thread_local! {
+        static OWN: Own = Own(
+            // SAFETY: plain event creation.
+            unsafe { CreateEventW(None, false, false, None) }.ok(),
+        );
+    }
+    OWN.try_with(|own| own.0).ok().flatten()
+}
+
 /// The adapter Windows ranks fastest, so a machine with an integrated GPU
 /// too runs on its discrete one.
 fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
@@ -538,6 +560,40 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A thread waiting for the card leaves `submitted` free: the card
+    /// reaches the value only after the CPU opens a gate, and meanwhile
+    /// another thread takes the lock; once the gate opens the wait ends.
+    #[test]
+    fn waiting_for_the_card_leaves_submitted_free() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = super::Host::new_warp() else { return };
+        // SAFETY: plain fence creation and queue commands on our own queue.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        // Far above anything a submission of this test could signal.
+        let target = 1 << 40;
+        // SAFETY: queue commands with our own live fences.
+        unsafe {
+            host.queue.Wait(&gate, 1).unwrap();
+            host.queue.Signal(&host.fence, target).unwrap();
+        }
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                host.wait_fence(target);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "the wait ended before the card got there");
+            let taken = host.submitted.try_lock().is_ok();
+            // SAFETY: a CPU signal of our own fence; lets the card go on.
+            unsafe { gate.Signal(1).unwrap() };
+            assert!(taken, "submitted was held while the card was waited for");
+        });
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        // SAFETY: a plain query.
+        assert!(unsafe { host.fence.GetCompletedValue() } >= target);
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1145,13 +1201,41 @@ impl Host {
         }
     }
 
-    /// Waits until the host GPU fence reaches at least `target`.
+    /// Waits until the host GPU fence reaches at least `target`, and the
+    /// submissions up to it are finished (their results put back).
+    ///
+    /// The card is waited for on an event of the calling thread's own,
+    /// without `submitted`: lists reset or dropped on the title's threads
+    /// and the timeline's signals wait here, and while one did under the
+    /// lock every other submission stood at `execute_inner`'s lock for as
+    /// long as the card ran (~10% of the submitting thread's samples,
+    /// docs/pesquisa/11). The lock is taken afterwards only to finish what
+    /// the card did; not at all if another thread finished it meanwhile.
     pub(crate) fn wait_fence(&self, target: u64) {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
-        // Run or not, an async submission is finished (its results put
-        // back) only under `submitted`.
+        if let Some(own) = own_event() {
+            // SAFETY: a plain fence query; the event is this thread's.
+            let waited = unsafe {
+                self.fence.GetCompletedValue() >= target
+                    || self.fence.SetEventOnCompletion(target, own).is_ok() && {
+                        WaitForSingleObject(own, INFINITE);
+                        true
+                    }
+            };
+            if waited {
+                if FINISHED_FENCE.load(Ordering::Acquire) >= target {
+                    return;
+                }
+                // Run or not, an async submission is finished (its results
+                // put back) only under `submitted`.
+                let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                self.reap_completed();
+                return;
+            }
+        }
+        // Without an event of its own: on the shared one, under the lock.
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         if FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
