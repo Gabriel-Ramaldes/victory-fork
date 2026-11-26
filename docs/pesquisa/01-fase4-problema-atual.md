@@ -248,6 +248,90 @@ diag):**
 - Depois, medir onde a comparação de ~600 MB por quadro encontra
   diferença (quantos tiles comparados mudam de fato), que é o alvo maior.
 
+## 4.2 A comparação da cópia de volta: quanto muda de fato
+
+Instrumentação só de diagnóstico, sem variável:
+- `backread::Tally`: soma por chamada de `sparse_back` e do `copy_back`
+  fora do sparse, e soma uma vez no total ao fim da chamada.
+- Aproveita o resultado da comparação existente (`host == old`, um
+  `memcmp` que para na primeira diferença) e o intervalo sujo que o merge
+  já devolve. Não faz segunda leitura.
+- Linha `copy-back compare per frame:` a cada 5 s.
+
+Rodada `compare-1` (save congelado, 6 min, `VICTORY_HOST_PADS=0`,
+configuração normal), últimos relatórios, por quadro:
+
+| Medida | Valor |
+|---|---|
+| chamadas / tiles comparados | ~104 / ~7.900 (quase todos de 64 KiB) |
+| volume comparado | ~515-520 MB |
+| tiles idênticos | 89-91% (~7.100 tiles, ~465 MB) |
+| tiles diferentes | 9-11% (~700-840 tiles, 46-54 MB, **limite superior** dos bytes alterados) |
+| gravado de volta na memória do jogo | 33-40 MB |
+| gravado por tile diferente | 0 B: 0; ≤64 B: ~24; ≤1 KiB: ~39; ≤4 KiB: ~26; ≤16 KiB: ~45; <64 KiB: 490-590; 64 KiB: 85-110 |
+| tempo somado das chamadas | 79-89 ms |
+| comparar | 41-44 ms |
+| ler + merge + gravar os diferentes | 37-43 ms |
+| tempo de parede da etapa ("copying back") | 82 ms |
+
+O caminho fora do sparse não apareceu (0 chamadas): na configuração
+normal, toda a cópia de volta passa por `sparse_back`.
+
+Leitura:
+- **A etapa roda, na prática, numa thread só.**
+  - O tempo somado das chamadas (79-89 ms) é igual ao tempo de parede
+    (82 ms).
+  - O `in_parallel` de 8 threads agrupa por `Shadow`, e todas as cópias
+    sparse caem na mesma raiz por pedaço de 2 GiB: um grupo, uma thread.
+- **90% da comparação não encontra nada.** ~465 MB por quadro são
+  comparados para concluir "igual".
+  - A comparação anda a ~12 GB/s, perto da banda de uma thread lendo dois
+    fluxos.
+  - Ou seja, o custo é volume, não implementação.
+- **Os tiles diferentes custam caro por tile:** ~52 µs cada, ~1,2 GB/s.
+  - Nesse tempo entram `read_into` de até 64 KiB, o merge palavra a
+    palavra, `watch::writing` (trava global do watch) e `write_mapped`.
+  - Ainda não está separado qual dessas partes pesa.
+- **A granularidade não é a alavanca.**
+  - Os tiles são quase sempre de 64 KiB inteiros. A comparação de um tile
+    diferente para cedo; a de um tile igual não tem como parar cedo.
+  - A gravação já se limita ao intervalo sujo: 33-40 MB gravados contra
+    46-54 MB de tiles diferentes, e a maioria grava menos que o tile.
+  - Tiles menores não reduziriam os bytes comparados.
+
+Oportunidades (não implementadas), da mais barata para a mais cara:
+1. **Paralelizar `sparse_back` por tile.**
+   - Comparação e merge são independentes por tile; hoje uma thread faz
+     tudo.
+   - Mesmas comparações e mesmo resultado: 8 threads poderiam levar os
+     ~80 ms para perto do limite de banda da memória.
+   - Cuidados:
+     - a trava `before`, mantida durante a chamada inteira;
+     - o buffer `title`;
+     - a ordem entre intervalos sobrepostos;
+     - `watch::writing` (trava global).
+2. **Separar o custo dos ~770 tiles diferentes** em `read_into`, merge,
+   `watch::writing` e `write_mapped`, antes de mexer neles.
+3. **Não comparar tiles que a GPU não pode ter escrito.**
+   - Os intervalos declarados graváveis (UAVs) são muito maiores que o
+     escrito: 90% iguais.
+   - Saber quais tiles cada envio escreve, por recurso e faixa, cortaria a
+     maior parte do volume.
+   - É a mudança de maior ganho e a de maior desenho.
+
+Overhead e limites desta medição:
+- **Etapa da cópia de volta:** 82 contra 84 ms na base, dentro do ruído.
+  Duas leituras de relógio por tile: ~8 mil tiles × ~25 ns ≈ 0,5 ms por
+  quadro de tempo de thread.
+- **O quadro subiu (383 contra 342 ms) por causa dos contadores sempre
+  ligados das etapas anteriores**, não desta. A etapa de cópias foi de 53
+  (base) para 58-62 ms com `copied()` (`f32d849`) e para 72 ms com
+  `retaken()` (`dad44fc`, mutex por tile). Esses contadores deveriam
+  passar a ser opcionais antes de novos A/B de tempo.
+- **A cena variou entre as rodadas** (3.800 draws contra 5.000 na base),
+  então volumes absolutos de MB por quadro não são estritamente
+  comparáveis entre elas.
+
 ## 5. Linha do tempo: melhorias e percalços
 
 **Fase 3 (24/11):** mundo alcançado em ~350 s, 0,3-1,9 fps, 600-1.100
@@ -323,7 +407,7 @@ pipelines na fila do driver. O quadro já era dominado pela CPU.
 
 | # | Problema | Evidência | Próximo passo barato |
 |---|---|---|---|
-| 1 | Snapshot e comparação na CPU (~24% da thread) | profiler, A/B, backread | card buffers não ajudam (§4). A cópia de volta compara ~600 MB por quadro para gravar ~34 MB, e o que volta é relido pelo próprio VIctory (eco do `watch::writing`), sem leitura do jogo vista (§4.1). O eco é ~20% das releituras (~10 ms/quadro) e não é idêntico (0,36%). O alvo maior é a comparação |
+| 1 | Snapshot e comparação na CPU (~24% da thread) | profiler, A/B, backread | card buffers não ajudam (§4). A cópia de volta compara ~600 MB por quadro para gravar ~34 MB, e o que volta é relido pelo próprio VIctory (eco do `watch::writing`), sem leitura do jogo vista (§4.1). O eco é ~20% das releituras (~10 ms/quadro) e não é idêntico (0,36%). A comparação: 90% dos ~515 MB/quadro são tiles iguais, e a etapa roda numa thread só (§4.2). Próximo: paralelizar `sparse_back` por tile (mesmo resultado) |
 | 2 | Quadro serial (preparo → GPU → cópia de volta) | profiler, fps line | só depois de 1: sobrepor o preparo do envio N+1 com a GPU do N exige resolver as quedas do relay |
 | 3 | Consultas de escrita: 11 GB conferidos por quadro | copystat | o bitmap não mudou o quadro (A/B); só vale atacar se o problema 1 sair do caminho antes |
 | 4 | `bindless_plan` (~10%) | profiler | ler as linhas quentes 1672-1816 |
