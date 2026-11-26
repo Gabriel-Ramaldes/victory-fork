@@ -143,16 +143,21 @@ enum Refusal {
 }
 
 /// Diagnostics: logs the first refusal of each kind (with the numbers it
-/// was decided on) and counts them all; no line per buffer.
+/// was decided on) and, in diagnostics builds with `VICTORY_COPY_COUNTS=1`,
+/// counts them all; no line per buffer.
 fn refused(why: Refusal, size: u64, a: u64, b: u64) {
     static SEEN: [AtomicBool; 6] = [const { AtomicBool::new(false) }; 6];
-    REFUSALS[why as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if crate::backread::counts() {
+        REFUSALS[why as usize].fetch_add(1, Ordering::Relaxed);
+    }
     if !SEEN[why as usize].swap(true, Ordering::Relaxed) {
         tracing::info!(?why, size, a, b, "card buffer refused (first of its kind; counts in the copy paths line)");
     }
 }
 
 /// Refusals by [`Refusal`], in its order.
+#[cfg(feature = "diagnostics")]
 static REFUSALS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Diagnostics: card buffer refusals so far, by kind.

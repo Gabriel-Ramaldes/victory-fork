@@ -1,9 +1,12 @@
 //! Diagnostics: is what the GPU wrote, once copied back into title memory,
 //! read by the CPU afterwards?
 //!
-//! Always (diagnostics builds): bytes and calls copied back, and the
-//! distinct 64 KiB blocks they touch per report, by origin (a host copy's
-//! `copy_back`/`sparse_back`, or a readback the title asked for).
+//! With `VICTORY_COPY_COUNTS=1` (diagnostics builds; off by default, and
+//! then no counter, lock or clock is touched on the copy paths): bytes and
+//! calls copied back, and the distinct 64 KiB blocks they touch per report,
+//! by origin (a host copy's `copy_back`/`sparse_back`, or a readback the
+//! title asked for); the echo split below; the comparison tally
+//! ([`Tally`]); and the copy path counts of `shadow::paths_text`.
 //!
 //! With `VICTORY_BACK_READS=<n>`: one block in `n` (chosen by its address,
 //! so the same blocks are followed) gets `PAGE_GUARD` on all its pages, at
@@ -19,10 +22,13 @@
 //! or touched by us only) and given back. At most [`SLOTS`] blocks are
 //! followed at once.
 //!
-//! Always too: bytes host copies take again from title memory, split by
+//! Counted too (`VICTORY_COPY_COUNTS=1`): bytes host copies take again
+//! from title memory, split by
 //! whether the same copy had just copied the block back (the echo of our
-//! own write), another had, or none; with the variable set, sampled echo
-//! blocks are compared with the copy first (bytes that differ).
+//! own write), another had, or none; with `VICTORY_BACK_READS` set too,
+//! sampled echo blocks are compared with the copy first (bytes that differ).
+//! The two variables are independent: following blocks with guard pages
+//! does not need the counters, and the counters do not guard anything.
 //!
 //! What this cannot see: GPU reads of title memory used in place; kernel
 //! accesses (a system call touching a guarded page fails once and clears
@@ -31,7 +37,7 @@
 //! a 64 KiB block (the copy-back and write-watch granularity).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -189,6 +195,25 @@ fn rate() -> u64 {
     })
 }
 
+/// `VICTORY_COPY_COUNTS=1`: the copy and copy-back counters (see the
+/// module notes). Off by default: they cost time on every copy.
+pub(crate) fn counts() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(test) || counts_asked(std::env::var("VICTORY_COPY_COUNTS").ok().as_deref());
+        if on {
+            tracing::warn!("VICTORY_COPY_COUNTS=1: copy and copy-back counters on (they cost time on every copy)");
+        } else {
+            tracing::info!("copy and copy-back counters off (VICTORY_COPY_COUNTS=1 turns them on)");
+        }
+        on
+    })
+}
+
+fn counts_asked(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim() == "1")
+}
+
 fn start() -> &'static Instant {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now)
@@ -197,23 +222,24 @@ fn start() -> &'static Instant {
 /// `len` bytes at `at` of title memory were just copied back from the GPU;
 /// `host` is where they are in the host copy they came from (0 if none).
 pub(crate) fn copied(at: usize, len: usize, kind: Kind, host: usize) {
-    if len == 0 {
+    let n = rate();
+    if len == 0 || n == 0 && !counts() {
         return;
     }
-    let k = kind as usize;
-    BYTES[k].fetch_add(len as u64, Ordering::Relaxed);
-    CALLS[k].fetch_add(1, Ordering::Relaxed);
     let (first, last) = ((at / PAGE) as u64, (at + len).div_ceil(PAGE) as u64);
-    {
-        let mut set = BLOCKS[k].lock().unwrap_or_else(|e| e.into_inner());
-        let set = set.get_or_insert_with(HashSet::new);
-        set.extend(first..last);
-    }
-    if let Kind::Shadow = kind {
-        let mut set = RUN_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(HashSet::new).extend(first..last);
-    }
-    {
+    if counts() {
+        let k = kind as usize;
+        BYTES[k].fetch_add(len as u64, Ordering::Relaxed);
+        CALLS[k].fetch_add(1, Ordering::Relaxed);
+        {
+            let mut set = BLOCKS[k].lock().unwrap_or_else(|e| e.into_inner());
+            let set = set.get_or_insert_with(HashSet::new);
+            set.extend(first..last);
+        }
+        if let Kind::Shadow = kind {
+            let mut set = RUN_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            set.get_or_insert_with(HashSet::new).extend(first..last);
+        }
         let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
         let backed = backed.get_or_insert_with(HashMap::new);
         for block in first..last {
@@ -221,7 +247,6 @@ pub(crate) fn copied(at: usize, len: usize, kind: Kind, host: usize) {
             backed.insert(block, base);
         }
     }
-    let n = rate();
     if n == 0 {
         return;
     }
@@ -653,7 +678,7 @@ pub(crate) fn announced(at: usize, len: usize) {
 /// same place (an echo), from elsewhere, or not; for sampled echo blocks
 /// (`VICTORY_BACK_READS`), compares title memory with what the copy holds.
 pub(crate) fn retaken(at: usize, len: usize, host: *const u8) {
-    if len == 0 {
+    if len == 0 || !counts() {
         return;
     }
     let n = rate();
@@ -696,28 +721,27 @@ pub(crate) fn retaken(at: usize, len: usize, host: *const u8) {
     }
 }
 
-/// The periodic line: copied back since the last one, and (when followed)
-/// the first accesses so far.
+/// The periodic line: copied back since the last one (with
+/// `VICTORY_COPY_COUNTS=1`), and (when followed) the first accesses so far;
+/// empty when both are off.
 pub(crate) fn report_text() -> String {
-    static SAID: AtomicBool = AtomicBool::new(false);
     let mut text = String::new();
-    for (k, name) in NAMES.iter().enumerate() {
-        let bytes = BYTES[k].swap(0, Ordering::Relaxed);
-        let calls = CALLS[k].swap(0, Ordering::Relaxed);
-        let blocks = BLOCKS[k].lock().unwrap_or_else(|e| e.into_inner()).take().map_or(0, |s| s.len());
-        text += &format!("{name} back since: {:.1} MB in {calls} writes, {blocks} blocks of 64 KiB; ", bytes as f64 / 1e6);
-    }
-    let mb = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / 1e6;
-    text += &format!(
-        "taken again since: echo {:.1} MB, copied back by another {:.1} MB, other {:.1} MB; ",
-        mb(&RETAKEN[0]),
-        mb(&RETAKEN[1]),
-        mb(&RETAKEN[2]),
-    );
-    if rate() == 0 {
-        if !SAID.swap(true, Ordering::Relaxed) {
-            text += "(VICTORY_BACK_READS=<n> follows their first CPU access)";
+    if counts() {
+        for (k, name) in NAMES.iter().enumerate() {
+            let bytes = BYTES[k].swap(0, Ordering::Relaxed);
+            let calls = CALLS[k].swap(0, Ordering::Relaxed);
+            let blocks = BLOCKS[k].lock().unwrap_or_else(|e| e.into_inner()).take().map_or(0, |s| s.len());
+            text += &format!("{name} back since: {:.1} MB in {calls} writes, {blocks} blocks of 64 KiB; ", bytes as f64 / 1e6);
         }
+        let mb = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        text += &format!(
+            "taken again since: echo {:.1} MB, copied back by another {:.1} MB, other {:.1} MB; ",
+            mb(&RETAKEN[0]),
+            mb(&RETAKEN[1]),
+            mb(&RETAKEN[2]),
+        );
+    }
+    if rate() == 0 {
         return text;
     }
     sweep();
@@ -834,13 +858,20 @@ const SPAN: usize = 18;
 /// per tile) and added to [`CMP`] when dropped.
 pub(crate) struct Tally {
     path: usize,
-    start: Instant,
+    /// When the call began; `None` when the counters are off (then nothing
+    /// is timed or counted).
+    start: Option<Instant>,
     n: [u64; F],
 }
 
 impl Tally {
     pub(crate) fn new(path: usize) -> Self {
-        Self { path, start: Instant::now(), n: [0; F] }
+        Self { path, start: counts().then(Instant::now), n: [0; F] }
+    }
+
+    /// When a tile's comparison begins (`None` when not counting).
+    pub(crate) fn tile_start(&self) -> Option<Instant> {
+        self.start.map(|_| Instant::now())
     }
 
     fn size(n: usize) -> usize {
@@ -853,7 +884,8 @@ impl Tally {
     }
 
     /// A tile of `n` bytes compared identical (the comparison began at `t0`).
-    pub(crate) fn same(&mut self, n: usize, t0: Instant) {
+    pub(crate) fn same(&mut self, n: usize, t0: Option<Instant>) {
+        let Some(t0) = t0 else { return };
         self.n[CMP_NS] += t0.elapsed().as_nanos() as u64;
         self.n[SAME] += 1;
         self.n[SAME_BYTES] += n as u64;
@@ -862,23 +894,26 @@ impl Tally {
 
     /// A tile of `n` bytes compared different; returns when the comparison
     /// ended (the rest of its work is timed from there).
-    pub(crate) fn differ(&mut self, n: usize, t0: Instant) -> Instant {
+    pub(crate) fn differ(&mut self, n: usize, t0: Option<Instant>) -> Option<Instant> {
+        let t0 = t0?;
         let t1 = Instant::now();
         self.n[CMP_NS] += (t1 - t0).as_nanos() as u64;
         self.n[DIFF] += 1;
         self.n[DIFF_BYTES] += n as u64;
         self.n[DIFF_SIZE + Self::size(n)] += 1;
-        t1
+        Some(t1)
     }
 
     /// The different tile's title memory could not be read.
-    pub(crate) fn unread(&mut self, t1: Instant) {
+    pub(crate) fn unread(&mut self, t1: Option<Instant>) {
+        let Some(t1) = t1 else { return };
         self.n[REST_NS] += t1.elapsed().as_nanos() as u64;
         self.n[UNREAD] += 1;
     }
 
     /// The different tile was read, merged and `written` bytes written back.
-    pub(crate) fn rest(&mut self, t1: Instant, written: usize) {
+    pub(crate) fn rest(&mut self, t1: Option<Instant>, written: usize) {
+        let Some(t1) = t1 else { return };
         self.n[REST_NS] += t1.elapsed().as_nanos() as u64;
         self.n[WRITTEN] += written as u64;
         let span = match written {
@@ -896,8 +931,9 @@ impl Tally {
 
 impl Drop for Tally {
     fn drop(&mut self) {
+        let Some(start) = self.start else { return };
         self.n[CMP_CALLS] = 1;
-        self.n[TOTAL_NS] = self.start.elapsed().as_nanos() as u64;
+        self.n[TOTAL_NS] = start.elapsed().as_nanos() as u64;
         for (total, &n) in CMP[self.path].iter().zip(&self.n) {
             if n != 0 {
                 total.fetch_add(n, Ordering::Relaxed);
@@ -906,8 +942,12 @@ impl Drop for Tally {
     }
 }
 
-/// The comparison of copies back since the last call, per frame.
+/// The comparison of copies back since the last call, per frame (empty
+/// when the counters are off).
 pub(crate) fn compare_text() -> String {
+    if !counts() {
+        return String::new();
+    }
     let now = crate::queue::presented();
     let frames = now.saturating_sub(CMP_FRAMES.swap(now, Ordering::Relaxed)).max(1) as f64;
     let mut text = String::from("copy-back compare per frame:");
@@ -1006,14 +1046,37 @@ mod tests {
         let before = [get(SAME), get(DIFF), get(WRITTEN), get(SAME_SIZE + 3), get(DIFF_SIZE), get(SPAN + 2)];
         {
             let mut tally = Tally::new(0);
-            tally.same(PAGE, Instant::now());
-            let t1 = tally.differ(100, Instant::now());
+            tally.same(PAGE, tally.tile_start());
+            let t1 = tally.differ(100, tally.tile_start());
             tally.rest(t1, 80);
             assert_eq!(get(SAME), before[0]);
         }
         assert!(get(SAME) > before[0] && get(DIFF) > before[1]);
         assert!(get(WRITTEN) >= before[2] + 80);
         assert!(get(SAME_SIZE + 3) > before[3] && get(DIFF_SIZE) > before[4] && get(SPAN + 2) > before[5]);
+    }
+
+    /// Only `VICTORY_COPY_COUNTS=1` turns the counters on.
+    #[test]
+    fn the_counters_are_asked_for_by_one() {
+        assert!(!counts_asked(None));
+        assert!(!counts_asked(Some("")));
+        assert!(!counts_asked(Some("0")));
+        assert!(!counts_asked(Some("8")));
+        assert!(counts_asked(Some("1")));
+        assert!(counts_asked(Some(" 1 ")));
+    }
+
+    /// A tally with no start (counters off) counts and times nothing.
+    #[test]
+    fn a_tally_off_counts_nothing() {
+        let mut tally = Tally { path: 0, start: None, n: [0; F] };
+        assert!(tally.tile_start().is_none());
+        tally.same(PAGE, None);
+        assert!(tally.differ(100, None).is_none());
+        tally.rest(None, 80);
+        tally.unread(None);
+        assert_eq!(tally.n, [0; F]);
     }
 
     fn n_ours() -> u64 {

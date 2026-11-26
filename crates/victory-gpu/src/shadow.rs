@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -586,7 +586,7 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 #[cfg(feature = "diagnostics")]
-                let t0 = std::time::Instant::now();
+                let t0 = tally.tile_start();
                 let differs = unchanged.differs(start + at, host, old);
                 #[cfg(feature = "diagnostics")]
                 let t1 = if differs {
@@ -2024,7 +2024,7 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            let t0 = std::time::Instant::now();
+            let t0 = tally.tile_start();
             if host == old {
                 #[cfg(feature = "diagnostics")]
                 tally.same(n, t0);
@@ -2292,16 +2292,26 @@ enum Path {
     LooseCard,
 }
 
-static PATHS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+#[cfg(feature = "diagnostics")]
+static PATHS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// Counts a range served by `p` (diagnostics builds with
+/// `VICTORY_COPY_COUNTS=1`; nothing otherwise).
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
 fn path(p: Path) {
-    PATHS[p as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if crate::backread::counts() {
+        PATHS[p as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Diagnostics: ranges served by each way so far, the copies made on the
 /// two ways that can place one in VRAM, and the card buffer refusals.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn paths_text() -> String {
+    if !crate::backread::counts() {
+        return String::new();
+    }
     let n = |p: Path| PATHS[p as usize].load(Ordering::Relaxed);
     format!(
         "copy paths: in place {}, sparse {}, buffer {} (made {}, in VRAM {}), loose {} (made {}, in VRAM {}); {}",

@@ -3462,17 +3462,17 @@ impl Meter {
             self.logged = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
+            // Empty when their counters are off (VICTORY_COPY_COUNTS,
+            // VICTORY_BACK_READS).
             #[cfg(feature = "diagnostics")]
-            tracing::info!("{}", crate::shadow::paths_text());
-            #[cfg(feature = "diagnostics")]
-            tracing::info!("back reads: {}", crate::backread::report_text());
-            #[cfg(feature = "diagnostics")]
-            tracing::info!("{}", crate::backread::compare_text());
-            #[cfg(feature = "diagnostics")]
-            {
-                let stacks = crate::backread::stacks_text();
-                if !stacks.is_empty() {
-                    tracing::info!("{stacks}");
+            for (prefix, line) in [
+                ("", crate::shadow::paths_text()),
+                ("back reads: ", crate::backread::report_text()),
+                ("", crate::backread::compare_text()),
+                ("", crate::backread::stacks_text()),
+            ] {
+                if !line.is_empty() {
+                    tracing::info!("{prefix}{line}");
                 }
             }
             #[cfg(feature = "diagnostics")]
