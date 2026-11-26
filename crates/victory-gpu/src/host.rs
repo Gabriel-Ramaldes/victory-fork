@@ -45,7 +45,38 @@ struct InFlight {
         std::sync::Arc<crate::resource::HostTexture>,
     )>,
     _plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+    /// A title submission's results, put back when it is waited for
+    /// ([`Host::finish_submission`]); `None` for one that owed nothing.
+    finish: Option<Owed>,
 }
+
+/// What a title submission that returned before the host GPU was done
+/// still owes: its lists (kept alive for their read-backs and
+/// bottom-of-pipe writes) and the ranges its shaders write.
+struct Owed {
+    lists: Vec<std::sync::Arc<HostList>>,
+    back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+}
+
+// SAFETY: host lists are free-threaded D3D12 objects, run by one thread
+// once closed; the rest is reference counted and locked.
+unsafe impl Send for Owed {}
+
+/// Whether the title's own submissions may return before the host GPU is
+/// done (`VICTORY_ASYNC_SUBMIT=1`), what they owe being put back when they
+/// are waited for. Off by default.
+fn async_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1");
+        tracing::info!(on, "title submissions may return before the host GPU is done");
+        on
+    })
+}
+
+/// The newest host fence value whose submission is finished: run, and
+/// what it owed put back.
+static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -253,6 +284,11 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+/// Whether a title submission is still to be waited for and finished.
+pub(crate) fn has_in_flight() -> bool {
+    matches!(HOST.get(), Some(Some(h)) if !h.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
 }
 
 /// Waits for any in-flight async host GPU submissions without creating the
@@ -1075,21 +1111,33 @@ impl Host {
         }
     }
 
-    /// Drops completed async submissions and buries objects retired before them.
+    /// Finishes the async submissions that have run, oldest first (what
+    /// they owe is put back), and buries objects retired before them. The
+    /// caller holds `submitted`: putting back is a submission's own work.
     fn reap_completed(&self) {
         // SAFETY: a plain fence query.
         let completed = unsafe { self.fence.GetCompletedValue() };
         let mut last_sub = 0u64;
-        {
-            let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            while let Some(front) = q.front() {
-                if front.fence <= completed {
-                    last_sub = last_sub.max(front.submission);
-                    q.pop_front();
-                } else {
-                    break;
+        loop {
+            let done = {
+                let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                match q.front() {
+                    Some(front) if front.fence <= completed => q.pop_front(),
+                    _ => None,
                 }
+            };
+            let Some(mut done) = done else { break };
+            last_sub = last_sub.max(done.submission);
+            let owed = done.finish.take();
+            if let Some(Owed { lists, back }) = &owed {
+                let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+                self.finish_submission(&runs, back.clone());
             }
+            // Before the lists go: dropping the last reference to one waits
+            // for this fence, which must be found finished (`submitted` is
+            // held here).
+            FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
+            drop(owed);
         }
         if last_sub != 0 {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
@@ -1099,15 +1147,15 @@ impl Host {
 
     /// Waits until the host GPU fence reaches at least `target`.
     pub(crate) fn wait_fence(&self, target: u64) {
-        if target == 0 {
+        if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
-        // SAFETY: a plain fence query.
-        if unsafe { self.fence.GetCompletedValue() } >= target {
-            self.reap_completed();
-            return;
-        }
+        // Run or not, an async submission is finished (its results put
+        // back) only under `submitted`.
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if FINISHED_FENCE.load(Ordering::Acquire) >= target {
+            return;
+        }
         // SAFETY: the fence and event are ours; guarded by `submitted`.
         unsafe {
             if self.fence.GetCompletedValue() < target {
@@ -1162,10 +1210,26 @@ impl Host {
         self.reap_completed();
     }
 
-    /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
-    /// bottom-of-pipe writes require GPU completion, or returns asynchronously
-    /// so CPU recording overlaps GPU execution.
+    /// Runs closed lists of ours (present, captures, uploads, read-backs)
+    /// and waits for them: their callers read or free what they made as
+    /// soon as this returns.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_inner(runs, None);
+    }
+
+    /// Runs the title's lists. With `VICTORY_ASYNC_SUBMIT=1` it returns
+    /// before the host GPU is done, so the title records its next lists
+    /// meanwhile; what the submission owes (shaders' writes, read-backs,
+    /// bottom-of-pipe writes) is put back when it is waited for: before the
+    /// next submission's preparation, a fence signal or work of the title's
+    /// queues ([`crate::timeline`]), a present, or a reset or drop of one of
+    /// its lists. Without it, or with card copies to finish, it waits.
+    pub(crate) fn execute_title(&self, runs: &[std::sync::Arc<HostList>]) {
+        let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+        self.execute_inner(&lists, Some(runs));
+    }
+
+    fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
         // One submission at a time from preparation to copy-back: snapshots
@@ -1267,15 +1331,7 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
-        let can_async = !cfg!(test)
-            && !each
-            && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
-            && card_writes.is_empty()
-            && cpu_back.is_empty()
-            && runs.iter().all(|list| {
-                let d = list.deferred();
-                d.readbacks.is_empty() && d.texture_backs.is_empty() && d.writes[d.early..].is_empty()
-            });
+        let can_async = !cfg!(test) && !each && keep.is_some() && async_submit() && card_writes.is_empty();
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
@@ -1368,9 +1424,6 @@ impl Host {
                 plan.clear_pending();
             }
             SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-            for list in runs {
-                list.deferred().early = 0;
-            }
             self.in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1379,6 +1432,7 @@ impl Host {
                     submission: this_submission,
                     _early_copies: early.copies,
                     _plans: batch.plans,
+                    finish: keep.map(|lists| Owed { lists: lists.to_vec(), back: cpu_back }),
                 });
             return;
         }
@@ -1411,7 +1465,7 @@ impl Host {
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
-        let copying = std::time::Instant::now();
+        let card_copying = std::time::Instant::now();
         if let Some(plan) = card_plan {
             if card_after_ran {
                 if let Some(engine_lock) = self.card_engine() {
@@ -1425,7 +1479,22 @@ impl Host {
                 plan.clear_pending();
             }
         }
-        let back = cpu_back;
+        COPY_BACK[0].fetch_add(card_copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.finish_submission(runs, cpu_back);
+        FINISHED_FENCE.fetch_max(*submitted, Ordering::AcqRel);
+        self.log_messages();
+    }
+
+    /// After a submission ran: what its shaders wrote goes back into title
+    /// memory, then its read-backs and textures read back, then the
+    /// bottom-of-pipe writes that tell the title the GPU is done. Under
+    /// `submitted`.
+    fn finish_submission(
+        &self,
+        runs: &[&HostList],
+        back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        let copying = std::time::Instant::now();
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
                 let written = shadow.copy_back(*address, *len);
@@ -1517,7 +1586,6 @@ impl Host {
             }
             deferred.early = 0;
         }
-        self.log_messages();
     }
 
     /// How host GPU timestamps map onto the title's GPU clock
