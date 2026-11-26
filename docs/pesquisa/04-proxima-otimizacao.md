@@ -139,3 +139,94 @@ por padrão, por exemplo `VICTORY_BACK_FIND_THREADS=<n>`):
 3. **Sucesso:** "copying back" cai 10 ms ou mais; o preparo não sobe;
    imagem igual; sem crash em 6 min. Se a banda limitar abaixo disso,
    registrar e partir para a instrumentação da alternativa 2.
+
+## 5. Resultado do experimento com 2 workers (25/11)
+
+Código: `09c16bb` (`VICTORY_BACK_COMPARE=<n>`, só diag, desligado por
+padrão), mais o modo de checagem `VICTORY_BACK_COMPARE_CHECK=1` (commit
+seguinte). Só a comparação `now != old` saiu da thread. A trava
+`before`, o merge, o `watch::writing`, o `VirtualProtect` e as gravações
+seguem em série, na mesma ordem. Os tiles da chamada são cortados em
+pedaços de ~1 MiB; a thread que chama faz pedaços também. Chamadas com
+menos de 2 MiB comparam na própria thread.
+
+**Método:**
+- build diag, save congelado, 6 min, `VICTORY_HOST_PADS=0`;
+- rodadas alternadas base / 2 workers;
+- medianas dos últimos 25 relatórios, com p25-p75.
+
+| Rodada | Quadro (ms) | Preparo | Cópia de volta | Draws |
+|---|---|---|---|---|
+| cmp-base-a | 350 (323-587) | 185 | 81 | 3.688 |
+| cmp-w2-a | 349 (336-445) | 187 | 71 | 4.795 |
+| cmp-base-b | 361 (340-416) | 191 | 74 | 6.390 |
+| cmp-w2-b | 344 (336-377) | 182 | 73 | 2.998 |
+
+As cenas não ficaram iguais: os draws variam de 3.000 a 6.400. Por isso
+a cópia de volta também foi normalizada pelo volume comparado:
+- base: 137 e 138 ms por GB;
+- 2 workers: 134 e 129 ms por GB;
+- diferença de −3 a −6%.
+
+**Par com `VICTORY_COPY_COUNTS=1`** (cmp-base-c / cmp-w2-c), tempos por
+quadro:
+
+| | base | 2 workers |
+|---|---|---|
+| comparação | 38,3 ms (511 MB, 13,4 GB/s) | 31,3 ms (524 MB, 16,7 GB/s) |
+| ler, fazer o merge e gravar os diferentes | 42,2 ms | 46,5 ms |
+| soma das chamadas | 83,2 ms | 79,4 ms |
+| cópia de volta (relógio) | 81 ms | 80 ms |
+| quadro | 366 ms | 354 ms |
+
+**Linha do pool** (2 workers, por quadro):
+- ~37-40 chamadas no pool, 27-29 ms, das quais ~1,0-1,2 ms esperando
+  pedaços dos workers;
+- ~65-73 chamadas pequenas na própria thread;
+- pedaços: ~170 pela thread que chama, ~330 pelos workers;
+- panicked 0.
+
+**Uso de CPU:** 2,6 a 3,1 núcleos (de 16) dos dois lados. Conjunto de
+trabalho de 19-21 GB e commit de 24-26 GB nos dois.
+
+**Estabilidade:** 8 rodadas de 6 min (3 base, 5 com workers, 2 delas de
+checagem), sem crash; `crashes.log` sem nada novo.
+
+**Equivalência no jogo:**
+- `VICTORY_BACK_COMPARE_CHECK=1` compara cada tile de novo na vez dele,
+  usa essa resposta e conta onde a dos workers diferiu.
+- Rodada cmp-w2-check2: **5.011.338 tiles rechecados, 0 discordâncias**.
+- A rodada anterior (cmp-w2-check) tinha o contador invertido (contava
+  concordâncias): marcou 3.326.546 de 3.326.546. É a mesma conclusão,
+  corrigida no código antes da check2.
+- O teste de unidade `tilecmp::the_answers_are_the_serial_ones` cobre
+  tiles aleatórios, parciais e diferenças no primeiro, no último e num
+  byte do meio.
+
+**Imagem:**
+- As capturas de quadros potência de 2 (telas de carregamento) estão
+  corretas nas duas configurações.
+- As capturas do mundo (`VICTORY_CAPTURE_WORLD=200`) mostram as mesmas
+  cenas corretas.
+- **Ponto em aberto:** em cmp-w2-c, quadros 11496/11497 (a cena da cela
+  junto à janela), há uma mancha azul em blocos num objeto escuro no
+  canto inferior direito.
+  - Em cmp-base-c (quadros 11972/11973) e nas 18 capturas dessa cena de
+    rodadas seriais antigas (`devbel-sparse-on`/`-off`), o objeto está
+    preto.
+  - Os quadros foram capturados em momentos diferentes da cena, e as
+    rodadas de checagem chegaram a outras cenas.
+  - Como as respostas dos workers são as seriais (0 discordâncias), a
+    mancha não vem de tiles tratados de outro jeito. Sobra uma diferença
+    de tempo (as threads mudam o ritmo do quadro) ou algo da própria
+    cena. Não foi reproduzida nem descartada.
+
+**Conclusão:**
+- A comparação caiu ~7 ms (38 para 31 ms). A cópia de volta caiu de 3 a
+  6% por GB comparado, e só ~1 ms no relógio do par -c.
+- O critério do §4 (cair 10 ms ou mais) **não foi atingido**.
+- Três threads dão só 1,3× na comparação (13,4 para 16,7 GB/s, dois
+  fluxos de leitura): o limite é a banda de memória do 3700X com
+  DDR4-3600, não o número de threads.
+- O preparo e o quadro não subiram, dentro do ruído de ±15%.
+- 4 workers ainda não testado: aguarda decisão.
