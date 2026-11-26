@@ -200,23 +200,53 @@ O que mediram:
 - Custo: n=64, 0,17 s em 6 min (nenhum efeito no quadro); n=8, 8,6 s
   (+3% no quadro).
 
-**Candidato a otimização segura (não implementado):**
-- Não marcar como desatualizadas, **para a própria cópia que fez a cópia
-  de volta**, as páginas que ela acabou de gravar. Elas já têm esses
-  bytes.
-- Continuar fixando os outros endereços da página física (aliases) e as
-  outras cópias.
-- Os bytes em que o jogo escreveu ao mesmo tempo já chegam pela guarda
-  e pelo write-watch como escrita do jogo.
+**Tamanho do eco (rodada `backreads-3`, n=8, guarda rearmada 2 ms depois
+de cada acesso nosso, contadores `taken again since` sempre ligados no
+diag):**
+- **Bytes:** por janela de 5 s (mediana dos últimos 25 relatórios), 459 MB
+  de eco e 1.878 MB de outras releituras.
+  - O eco é **~20% do que a etapa de cópias relê** (~40 de ~200 MB por
+    quadro), algo como 9-10 ms dos ~46 ms dessa etapa, por proporção.
+  - **Não explica os ~80 ms da cópia de volta,** que são a comparação de
+    ~600 MB por quadro.
+- **O jogo continua sem tocar:** 1.036 acompanhamentos (172 blocos
+  distintos), 74 mil rearmes, **0 acessos do jogo em qualquer momento** e
+  0 depois de um acesso nosso.
+  - 935 acompanhamentos chegaram aos 30 quadros só com acessos nossos.
+  - 16,6 mil escritas anunciadas (`watch::writing`: cópia de volta e I/O)
+    tiraram a guarda antes de escrever.
+- **O eco não é idêntico:** dos 1.915 MB de eco comparados (blocos
+  amostrados, antes de reler), **6,9 MB diferem (0,36%)**.
+  - Esses blocos não tiveram acesso do jogo pela CPU depois da cópia de
+    volta. A causa mais provável, lida no código, são escritas do jogo
+    **durante** o trabalho da GPU: o merge leva essas escritas para a
+    memória do jogo, mas não para a cópia na GPU.
+  - Uma alternativa a descartar: bytes da GPU fora dos intervalos
+    pendentes.
+- **Custo:** com rearme, a medição pesa (434 ms/quadro contra 342; 27 s
+  em 6 min). As contagens valem, mas os tempos desta rodada não servem
+  para comparar.
 
-**Próximo experimento:** dois contadores, ainda sem mudar comportamento.
-1. Bytes que `copy_stale` relê em blocos fixados pela própria cópia de
-   volta: o tamanho do eco em MB por quadro.
-2. Rearmar a guarda depois do acesso do VIctory, para cobrir também as
-   leituras do jogo depois do eco, até o horizonte de 30 quadros.
+**Conclusão sobre o candidato:**
+- "Não reler o que a própria cópia gravou" **não é seguro** como estava
+  escrito: perderia os 0,36% acima.
+- Além disso, enquanto o bloco está fixado por `watch::writing` (2 s,
+  sem guarda), escritas do jogo nele não ficam registradas. O eco é o
+  preço dessa fixação.
+- Uma versão segura precisaria de duas mudanças juntas:
+  1. gravar na cópia da GPU o resultado do merge na hora da cópia de
+     volta;
+  2. para as nossas escritas síncronas, recolocar a guarda logo depois,
+     em vez de fixar por 2 s.
+- Ganho esperado: da ordem de 10 ms por quadro, pequeno perto dos 80 ms
+  da comparação.
 
-Se o eco for relevante e o jogo continuar sem ler, aí sim um A/B com a
-mudança acima, conferindo imagem idêntica.
+**Próximo experimento:**
+- Contar, dentro de `sparse_back`, quantos bytes do merge diferem da cópia
+  na GPU logo após a cópia de volta.
+- Se bater com os 0,36%, a explicação se confirma.
+- Depois, medir onde a comparação de ~600 MB por quadro encontra
+  diferença (quantos tiles comparados mudam de fato), que é o alvo maior.
 
 ## 5. Linha do tempo: melhorias e percalços
 
@@ -293,7 +323,7 @@ pipelines na fila do driver. O quadro já era dominado pela CPU.
 
 | # | Problema | Evidência | Próximo passo barato |
 |---|---|---|---|
-| 1 | Snapshot e comparação na CPU (~24% da thread) | profiler, A/B, backread | card buffers não ajudam (§4). A cópia de volta compara ~600 MB por quadro para gravar ~34 MB, e o que volta é relido pelo próprio VIctory (eco do `watch::writing`), sem leitura do jogo vista (§4.1). Próximo: medir o tamanho do eco |
+| 1 | Snapshot e comparação na CPU (~24% da thread) | profiler, A/B, backread | card buffers não ajudam (§4). A cópia de volta compara ~600 MB por quadro para gravar ~34 MB, e o que volta é relido pelo próprio VIctory (eco do `watch::writing`), sem leitura do jogo vista (§4.1). O eco é ~20% das releituras (~10 ms/quadro) e não é idêntico (0,36%). O alvo maior é a comparação |
 | 2 | Quadro serial (preparo → GPU → cópia de volta) | profiler, fps line | só depois de 1: sobrepor o preparo do envio N+1 com a GPU do N exige resolver as quedas do relay |
 | 3 | Consultas de escrita: 11 GB conferidos por quadro | copystat | o bitmap não mudou o quadro (A/B); só vale atacar se o problema 1 sair do caminho antes |
 | 4 | `bindless_plan` (~10%) | profiler | ler as linhas quentes 1672-1816 |
