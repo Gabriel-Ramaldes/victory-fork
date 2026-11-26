@@ -164,3 +164,70 @@ Uma otimização vale se reduzir o frame time no benchmark, em pares A/B interca
   - a diferença média entre builds diferentes (33,8, 34,1 e 3,8) ficou igual à diferença entre rodadas do mesmo build (34,8, 33,7 e 34,6);
   - as rodadas caem em momentos diferentes da cena, com o personagem e a câmera em outra posição;
   - a olho, nenhum artefato em B.
+
+## Oportunidade 1: o que as copies copiam (mesmo dia, rodadas `refresh-1` a `refresh-8`)
+
+**Contadores só de diagnóstico** (`shadow.rs`, `watch.rs` e `copystat.rs`), ligados por `VICTORY_COPY_COUNTS=1`:
+- caminho de cada refresh (`Shadow::update_free`): calls, bytes pedidos, bytes copiados e tempo;
+- faixas pedidas de novo no mesmo quadro;
+- `VICTORY_CLEAN_VERIFY=1`: uma faixa achada limpa é checada mesmo assim;
+- `VICTORY_COPY_DIFFERS=1`: cada cópia é comparada byte a byte com a cópia do host, e cada página é atribuída ao motivo de ter sido marcada escrita;
+- simulação de um epoch de 1 MiB.
+
+**Resultados por quadro, no mundo:**
+- **Caminhos:** `clean` 6,7–10 mil chamadas (0,2 ms); `guarded` 14–16 mil chamadas, 10–12 GB pedidos, 620–690 MB copiados, ~500 ms somados nas threads. Write-watch e memória não vigiada: ~0.
+- **Pedidos repetidos no mesmo quadro:** só ~3 mil chamadas, 96% sem copiar nada. Não são o custo.
+- **Epoch de 1 MiB:** pularia 10–12 mil chamadas, mas ~40% delas copiam 140–190 MB. Não é seguro assim.
+- **`clean_spans` atual:** as faixas que ele pula, se checadas, copiariam 120–190 MB, com 0 bytes diferentes no mundo. O atalho está correto; essas cópias seriam redundantes.
+- **Volume:** de ~600 MB copiados, só 30–40 MB de bytes mudam. ~83% (~490 MB, ~9,5 mil cópias) não mudam nada.
+
+**Por motivo da marca de escrita:**
+
+| Motivo | Copiado | Não mudou nada |
+|---|---|---|
+| nunca copiada | ~110 MB | ~100% |
+| GPU in place (`gpu_wrote` marca a faixa declarada inteira) | ~228 MB | 84% |
+| aberta por falta de escrita (granularidade de 64 KiB) | ~170 MB | 69% |
+| protegida mas "não limpa" | ~50 MB | 90% |
+
+## Correção: páginas copiadas em parte
+
+**Defeito:** `Shadow::copy_stale` copia só a parte de uma página que a faixa cobre e deixa a página como "nunca copiada", porque ao lado os shaders podem estar escrevendo a cópia. Toda chamada copiava essa parte de novo.
+
+**Correção:**
+- `Shadow::edges` guarda, por página, a parte copiada e o carimbo do journal.
+- Uma parte já copiada, ou menor que ela, só é copiada de novo se a página foi escrita depois desse carimbo, a mesma regra das páginas inteiras.
+- Uma parte nova é copiada e lembrada.
+- Quando um tile esparso é devolvido, a página é esquecida, junto com o `copied`.
+- A ordem de locks é `copied` e depois `edges`.
+- `VICTORY_EDGE_PAGES=0` (só em diagnóstico) volta ao comportamento antigo, para rollback e A/B.
+
+**Teste** `shadow::tests::a_page_copied_in_part_is_copied_again_only_when_written` (WARP):
+- duas páginas cobertas em parte;
+- a segunda chamada não copia nada;
+- uma escrita do título faz só aquela parte ser copiada de novo;
+- uma parte ainda não copiada é copiada;
+- os bytes conferem com o título.
+- Com a correção desligada, o teste falha. Suíte `victory-gpu --lib`: 143 passaram.
+
+**Checagem no jogo (`edges-check`, com contadores):**
+- as partes que deixaram de ser copiadas são ~3,9 mil páginas e ~135 MB por quadro, e 100% delas não mudariam nenhum byte;
+- "nunca copiada" caiu de ~110 para ~15 MB;
+- o total das cópias de refresh caiu de ~600 para ~430 MB por quadro.
+
+**A/B** (mesmo binário diag; A com `VICTORY_EDGE_PAGES=0`, B padrão; 3 pares intercalados, 270 s, capturas):
+
+| | A1 / A2 / A3 | B1 / B2 / B3 |
+|---|---|---|
+| quadro | 287,4 / 260,6 / 241,1 | 227,3 / 193,2 / 250,3 |
+| copies | 35,9 / 37,5 / 36,7 | 26,4 / 24,9 / 32,2 |
+| draws | 8,7 / 8,8 / 8,8 mil | 6,5 / 6,3 / 6,5 mil |
+
+- **Cena:** as rodadas A e B não viram a mesma coisa. A câmera do início muda de rodada para rodada; nas A ela olhava para a porta (~8,8 mil draws), nas B para a janela (~6,4 mil). Os draws seguem o mesmo padrão de duas faixas nas rodadas sem a correção (`fence-*` ~6,4 mil, `pool-*` ~8,9 mil), então a diferença não vem da correção. Mesmo assim, a comparação direta do quadro não vale.
+- **Comparação no mesmo patamar de cena** (~6,4 mil draws), contra `fence-B1..3` do mesmo dia, sem a correção:
+  - copies 33,7 → 27,8 ms em média (−6 ms), com ~135 → ~99 MB;
+  - quadro 227,6 → 223,6 ms, dentro do ruído.
+- **Estabilidade:** nenhuma queda nem perda de device nas 7 rodadas. Commit 26,5–28,0 GB nos dois lados.
+- **Imagem:** a olho, nenhuma diferença atribuível à correção. Numa captura de A3, que roda com o comportamento antigo, apareceu uma textura multicolorida nas costas do personagem. O defeito já existia, independente da correção.
+
+**Pendente:** confirmar o frame time com rodadas emparelhadas pela mesma vista inicial.

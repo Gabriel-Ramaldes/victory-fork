@@ -44,10 +44,91 @@ const REGION_BUCKETS: usize = 1024;
 static REGION_EPOCHS: [AtomicU64; REGION_BUCKETS] =
     [const { AtomicU64::new(1) }; REGION_BUCKETS];
 
+/// Diagnostics (`VICTORY_COPY_COUNTS=1`): epochs as [`REGION_EPOCHS`], by
+/// 1 MiB instead of 64 MiB, to measure what a finer epoch would let
+/// `clean_spans` skip (`shadow::refresh_counted`).
+#[cfg(feature = "diagnostics")]
+const FINE_SHIFT: usize = 20;
+#[cfg(feature = "diagnostics")]
+const FINE_BUCKETS: usize = 1 << 16;
+#[cfg(feature = "diagnostics")]
+static FINE_EPOCHS: [AtomicU64; FINE_BUCKETS] = [const { AtomicU64::new(1) }; FINE_BUCKETS];
+
+/// [`region_epoch`] by 1 MiB (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn fine_epoch(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let (first, last) = (start >> FINE_SHIFT, (end - 1) >> FINE_SHIFT);
+    if last - first + 1 >= FINE_BUCKETS {
+        return u64::MAX;
+    }
+    (first..=last).fold(0u64, |hash, r| {
+        hash.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(FINE_EPOCHS[r & (FINE_BUCKETS - 1)].load(Ordering::Acquire))
+    })
+}
+
+/// Diagnostics (`VICTORY_COPY_DIFFERS=1`): why each page was last noted
+/// written, by page: [`ORIGIN_PIN`] and the others.
+#[cfg(feature = "diagnostics")]
+static ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<usize, u8>>> = std::sync::Mutex::new(None);
+
+/// A pin held it open (our copies, the kernel, a GPU window).
+#[cfg(feature = "diagnostics")]
+pub(crate) const ORIGIN_PIN: u8 = 1;
+/// Read-only but not clean: something other than a fault said written.
+#[cfg(feature = "diagnostics")]
+pub(crate) const ORIGIN_UNCLEAN: u8 = 2;
+/// Found open: a write fault (or an opening) since it was guarded.
+#[cfg(feature = "diagnostics")]
+pub(crate) const ORIGIN_OPEN: u8 = 3;
+/// The host GPU wrote it in place (`gpu_wrote`, the whole declared range).
+#[cfg(feature = "diagnostics")]
+pub(crate) const ORIGIN_GPU: u8 = 4;
+/// The runtime wrote a streamed file into it.
+#[cfg(feature = "diagnostics")]
+pub(crate) const ORIGIN_STREAM: u8 = 5;
+
+#[cfg(feature = "diagnostics")]
+fn note_origin(first: usize, last: usize, origin: u8) {
+    if !crate::backread::counts() || std::env::var_os("VICTORY_COPY_DIFFERS").is_none() {
+        return;
+    }
+    let mut o = ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+    let o = o.get_or_insert_with(Default::default);
+    for page in first..last {
+        if origin == ORIGIN_UNCLEAN && o.get(&page) == Some(&ORIGIN_GPU) {
+            continue;
+        }
+        o.insert(page, origin);
+    }
+}
+
+/// Why `page` was last noted written (0: not known).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn origin_of(page: usize) -> u8 {
+    ORIGINS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|o| o.get(&page).copied()).unwrap_or(0)
+}
+
 #[inline]
 fn bump_region_epochs(start: usize, end: usize) {
     if start >= end {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    if crate::backread::counts() {
+        let (first, last) = (start >> FINE_SHIFT, (end - 1) >> FINE_SHIFT);
+        if last - first + 1 >= FINE_BUCKETS {
+            FINE_EPOCHS.iter().for_each(|slot| {
+                slot.fetch_add(1, Ordering::Release);
+            });
+        } else {
+            for r in first..=last {
+                FINE_EPOCHS[r & (FINE_BUCKETS - 1)].fetch_add(1, Ordering::Release);
+            }
+        }
     }
     let first = start >> REGION_SHIFT;
     let last = (end - 1) >> REGION_SHIFT;
@@ -595,12 +676,16 @@ fn walk(g: &mut Guards, first: usize, last: usize, check_each: bool) -> Vec<usiz
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                #[cfg(feature = "diagnostics")]
+                note_origin(block * BLOCK / PAGE, (block + 1) * BLOCK / PAGE, ORIGIN_PIN);
                 // No range holding it is clean meanwhile (`region_epoch`).
                 bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
             } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                #[cfg(feature = "diagnostics")]
+                note_origin(block * BLOCK / PAGE, (block + 1) * BLOCK / PAGE, ORIGIN_UNCLEAN);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -707,6 +792,8 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
         written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
+        #[cfg(feature = "diagnostics")]
+        note_origin(from * BLOCK / PAGE, to * BLOCK / PAGE, ORIGIN_OPEN);
     };
     if set(from, to) {
         note(g, written, from, to);
@@ -1012,6 +1099,8 @@ pub fn title_memory_written(at: usize, len: usize) {
                 j.written.insert(page, now);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        note_origin(at / PAGE, (at + len).div_ceil(PAGE), ORIGIN_STREAM);
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
     }
 }
@@ -1057,6 +1146,10 @@ pub(crate) fn gpu_wrote(at: usize, len: usize) {
                 j.written.insert(page, now);
             }
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    for block in &blocks {
+        note_origin(block * BLOCK / PAGE, (block + 1) * BLOCK / PAGE, ORIGIN_GPU);
     }
     // Runs of blocks next to one another, one bump each.
     let mut run: Option<(usize, usize)> = None;

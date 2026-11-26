@@ -149,6 +149,9 @@ pub(crate) fn log(frames: f64) {
         c[C::PinsAsyncDone as usize],
         crate::watch::pins_alive(),
     );
+    if let Some(line) = crate::shadow::refresh_paths_text(frames) {
+        tracing::info!("{line}");
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

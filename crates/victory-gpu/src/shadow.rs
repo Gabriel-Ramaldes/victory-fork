@@ -35,6 +35,12 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Pages copied only in part, by page: the part `[from, to)` and the
+    /// asking after which it was copied ([`Shadow::copy_stale`]). Without
+    /// it such a page stays "never copied" and its part is copied again at
+    /// every refresh: ~110 MB a frame in the world on 2026-11-26, none of
+    /// it changing a byte. Locked after `copied`.
+    edges: Mutex<std::collections::HashMap<usize, (usize, usize, u64)>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -273,6 +279,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            edges: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
@@ -748,6 +755,32 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
+        #[cfg(feature = "diagnostics")]
+        if crate::backread::counts() {
+            let fine = crate::watch::fine_epoch(from, to);
+            let began = std::time::Instant::now();
+            IN_REFRESH.with(|r| r.set(true));
+            let copied = self.update_free_paths(from, to, lazy);
+            IN_REFRESH.with(|r| r.set(false));
+            let us = began.elapsed().as_micros() as u64;
+            if CLEAN_VERIFIED.with(|v| v.replace(false)) {
+                use std::sync::atomic::Ordering::Relaxed;
+                CLEAN_CHECKED[0].fetch_add(1, Relaxed);
+                if copied > 0 {
+                    CLEAN_CHECKED[1].fetch_add(1, Relaxed);
+                    CLEAN_CHECKED[2].fetch_add(copied as u64, Relaxed);
+                }
+            }
+            let path = refresh_counted(self as *const Shadow as usize, from, to, copied, us);
+            fine_counted(self as *const Shadow as usize, from, to, copied, us, path, fine);
+            return copied;
+        }
+        self.update_free_paths(from, to, lazy)
+    }
+
+    /// [`Shadow::update_free`]; which way it went is noted for
+    /// [`refresh_counted`] ([`refresh_path`]).
+    fn update_free_paths(&self, from: usize, to: usize, lazy: bool) -> usize {
         // Diagnostics (`VICTORY_ALWAYS_COPY`): 1 no write watch and no
         // guard, every copy taken again once a frame, every tile looked at
         // (slow); 2 only every tile looked at (no waiting 2 to 16 frames for
@@ -767,9 +800,20 @@ impl Shadow {
             let ge = crate::watch::region_epoch(from, to);
             {
                 let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                if spans.get(&(from, to)) == Some(&ge) {
+                // Diagnostics (`VICTORY_CLEAN_VERIFY=1`, with
+                // `VICTORY_COPY_COUNTS=1`): a range found clean is checked
+                // all the same, and what that copies is counted.
+                #[cfg(feature = "diagnostics")]
+                let verify = clean_verify();
+                #[cfg(not(feature = "diagnostics"))]
+                let verify = false;
+                if spans.get(&(from, to)) == Some(&ge) && verify {
+                    #[cfg(feature = "diagnostics")]
+                    CLEAN_VERIFIED.with(|v| v.set(true));
+                } else if spans.get(&(from, to)) == Some(&ge) {
                     #[cfg(feature = "diagnostics")]
                     {
+                        refresh_path(RefreshPath::Clean);
                         use crate::copystat::{C, add};
                         add(C::Checked, (to - from) as u64);
                         add(C::Unchanged, (to - from) as u64);
@@ -778,6 +822,8 @@ impl Shadow {
                 }
             }
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+                #[cfg(feature = "diagnostics")]
+                refresh_path_written(RefreshPath::Guarded, !written.is_empty());
                 let copied = self.copy_stale(from, to, now, &written);
                 if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
@@ -798,6 +844,8 @@ impl Shadow {
             // Probe write-watch first; if that fails and guard succeeds, mark
             // this shadow as guarded so subsequent calls skip GetWriteWatch.
             if let Some((now, written)) = crate::watch::writes(from, to, false) {
+                #[cfg(feature = "diagnostics")]
+                refresh_path(RefreshPath::Watched);
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
@@ -810,6 +858,8 @@ impl Shadow {
             }
             let ge = crate::watch::region_epoch(from, to);
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+                #[cfg(feature = "diagnostics")]
+                refresh_path_written(RefreshPath::Guarded, !written.is_empty());
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 if crate::watch::region_epoch(from, to) == ge {
@@ -841,9 +891,13 @@ impl Shadow {
         {
             let mut seen = self.unwatched.lock().unwrap_or_else(|e| e.into_inner());
             if !cfg!(test) && seen.insert((from, to), frame) == Some(frame) {
+                #[cfg(feature = "diagnostics")]
+                refresh_path(RefreshPath::UnwatchedAgain);
                 return 0;
             }
         }
+        #[cfg(feature = "diagnostics")]
+        refresh_path(RefreshPath::Unwatched);
         if let Some(s) = self.sparse.as_ref().filter(|_| !cfg!(test)) {
             return self.copy_tiles(s, from, to, frame, lazy);
         }
@@ -958,7 +1012,9 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut edges = self.edges.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
@@ -971,12 +1027,39 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+            // The part of the page in the range, and whether that is all of
+            // the page the copy holds.
+            let (a, b) = ((page * PAGE).max(from).max(start), ((page + 1) * PAGE).min(to).min(end));
+            let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+            let stale = match edges.get(&page) {
+                // Copied in part before, that part or more: stale only if
+                // written since, as a whole page is.
+                Some(&(was_from, was_to, when)) if !whole && was_from <= a && b <= was_to && edge_pages() => {
+                    #[cfg(feature = "diagnostics")]
+                    if write <= when && copy_differs_on() {
+                        // Left as it is: would copying it have changed it?
+                        self.origin_counted(6, a, b);
+                    }
+                    write > when
+                }
+                _ => *at == 0 || write > *at,
+            };
+            #[cfg(feature = "diagnostics")]
+            if stale && copy_differs_on() {
+                let origin = if *at == 0 { 0 } else { crate::watch::origin_of(page) };
+                self.origin_counted(origin, a, b);
+            }
+            if stale {
+                if whole {
                     *at = now;
+                    edges.remove(&page);
+                } else {
+                    // A page only partly in the range is copied in part: the
+                    // rest stays stale, and the part is remembered.
+                    if edges.len() >= 1 << 16 {
+                        edges.clear();
+                    }
+                    edges.insert(page, (a, b, now));
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -990,6 +1073,55 @@ impl Shadow {
         bytes
     }
 
+    /// Diagnostics (`VICTORY_COPY_DIFFERS=1`): counts the page span
+    /// `[a, b)` about to be copied under `origin` (0: never copied), and
+    /// whether the copy would change any byte of it.
+    #[cfg(feature = "diagnostics")]
+    fn origin_counted(&self, origin: u8, a: usize, b: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (a, b) = (a.max(start), b.min(end));
+        if a >= b {
+            return;
+        }
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut same = true;
+        let mut readable = true;
+        TITLE.with(|t| {
+            let mut t = t.borrow_mut();
+            t.resize(b - a, 0);
+            if !crate::host::read_into(a as *const u8, &mut t[..]) {
+                readable = false;
+                return;
+            }
+            let mut check = |at: usize, data: *mut u8, n: usize| {
+                // SAFETY: the host copy's mapping of these bytes.
+                let host = unsafe { std::slice::from_raw_parts(data as *const u8, n) };
+                if host != &t[at - a..at - a + n] {
+                    same = false;
+                }
+            };
+            if let Some(s) = &self.sparse {
+                self.each_tile(s, a, b, &mut check);
+            } else {
+                // SAFETY: inside the mapping.
+                check(a, unsafe { self.data.add(a - start) }, b - a);
+            }
+        });
+        if !readable {
+            return;
+        }
+        let at = usize::from(origin.min(6)) * 4;
+        ORIGIN_COPIES[at].fetch_add(1, Relaxed);
+        ORIGIN_COPIES[at + 1].fetch_add((b - a) as u64, Relaxed);
+        if same {
+            ORIGIN_COPIES[at + 2].fetch_add(1, Relaxed);
+            ORIGIN_COPIES[at + 3].fetch_add((b - a) as u64, Relaxed);
+        }
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -998,6 +1130,8 @@ impl Shadow {
             self.each_tile(s, from, to, |at, data, n| {
                 #[cfg(feature = "diagnostics")]
                 crate::backread::retaken(at, n, data);
+                #[cfg(feature = "diagnostics")]
+                clean_verify_differs(data, at, n);
                 crate::host::copy_mapped(data, at as *const u8, n, false);
             });
             return to - from;
@@ -1006,6 +1140,8 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         #[cfg(feature = "diagnostics")]
         crate::backread::retaken(from, to - from, at);
+        #[cfg(feature = "diagnostics")]
+        clean_verify_differs(at, from, to - from);
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         if let Some(card) = &self.card {
             card.mark_dirty(from - start, to - start);
@@ -1079,6 +1215,7 @@ fn placed(
         start,
         len,
         copied: Mutex::default(),
+        edges: Mutex::default(),
         watched: AtomicU8::new(NOT_WATCHED),
         pending: Mutex::default(),
         before: Mutex::default(),
@@ -1805,11 +1942,13 @@ pub(crate) fn sweep(frame: u64) {
         {
             let base = shadow.start as usize / PAGE;
             let mut copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut edges = shadow.edges.lock().unwrap_or_else(|e| e.into_inner());
             for (at, _) in &old {
                 let page = (shadow.start as usize / PAGE + *at as usize) - base;
                 if let Some(c) = copied.get_mut(page) {
                     *c = 0;
                 }
+                edges.remove(&(base + page));
             }
         }
         shadow
@@ -1924,6 +2063,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         start,
         len,
         copied: Mutex::new(if of.is_some() { Vec::new() } else { vec![0; (len / PAGE as u64) as usize] }),
+        edges: Mutex::default(),
         watched: AtomicU8::new(0),
         pending: Mutex::default(),
         before: Mutex::default(),
@@ -1940,6 +2080,331 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         }),
         card: None,
     })
+}
+
+/// Whether pages copied in part are remembered ([`Shadow::edges`]);
+/// diagnostics builds: `VICTORY_EDGE_PAGES=0` copies them at every refresh,
+/// as before, for comparing.
+fn edge_pages() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_EDGE_PAGES").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    true
+}
+
+/// Diagnostics (`VICTORY_COPY_COUNTS=1`): which way a refresh of memory
+/// no shader writes went ([`Shadow::update_free`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+enum RefreshPath {
+    /// Guarded, and found clean since the last check (`clean_spans`).
+    Clean,
+    /// Guarded, the guards asked.
+    Guarded,
+    /// Write-watched, the write watch asked.
+    Watched,
+    /// Not watchable, copied once a frame: asked again this frame.
+    UnwatchedAgain,
+    /// Not watchable: copied (sparse: its tiles looked at).
+    Unwatched,
+}
+
+#[cfg(feature = "diagnostics")]
+const REFRESH_PATHS: usize = 5;
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static REFRESH_PATH: std::cell::Cell<u8> = const { std::cell::Cell::new(u8::MAX) };
+}
+
+#[cfg(feature = "diagnostics")]
+fn refresh_path(path: RefreshPath) {
+    REFRESH_PATH.with(|p| p.set(path as u8));
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Whether the guards reported pages of the range written.
+    static REFRESH_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The refresh going on was found clean and is checked all the same.
+    static CLEAN_VERIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `VICTORY_CLEAN_VERIFY=1` with `VICTORY_COPY_COUNTS=1` (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn clean_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backread::counts() && std::env::var_os("VICTORY_CLEAN_VERIFY").is_some_and(|v| v == "1"))
+}
+
+/// Ranges found clean and checked all the same: calls, and of them those
+/// that copied, and their bytes.
+#[cfg(feature = "diagnostics")]
+static CLEAN_CHECKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Of the copies made by ranges found clean and checked all the same: bytes
+/// looked at, bytes that differed from the host copy, copies with any byte
+/// differing, copies whose title bytes could not be read.
+#[cfg(feature = "diagnostics")]
+static CLEAN_DIFFERS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The same for every copy a refresh of memory no shader writes makes
+/// (`VICTORY_COPY_DIFFERS=1` with `VICTORY_COPY_COUNTS=1`).
+#[cfg(feature = "diagnostics")]
+static ALL_DIFFERS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// A refresh of memory no shader writes is going on.
+    static IN_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Per origin of the page's last write note (0 never copied, then
+/// `watch::ORIGIN_*`; 6: a part of an edge page left as it was, not
+/// copied): pages copied, bytes, of them pages that changed nothing, bytes.
+#[cfg(feature = "diagnostics")]
+static ORIGIN_COPIES: [std::sync::atomic::AtomicU64; 28] = [const { std::sync::atomic::AtomicU64::new(0) }; 28];
+
+#[cfg(feature = "diagnostics")]
+fn copy_differs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backread::counts() && std::env::var_os("VICTORY_COPY_DIFFERS").is_some_and(|v| v == "1"))
+}
+
+/// Diagnostics: during a range found clean and checked all the same
+/// (`VICTORY_CLEAN_VERIFY=1`), counts how many of the `n` bytes the copy is
+/// about to write at `dst` from title memory at `src` differ from what the
+/// host copy holds: what skipping the range would have left stale.
+#[cfg(feature = "diagnostics")]
+fn clean_verify_differs(dst: *const u8, src: usize, n: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if n == 0 {
+        return;
+    }
+    let counters: &[std::sync::atomic::AtomicU64] = if CLEAN_VERIFIED.with(|v| v.get()) {
+        &CLEAN_DIFFERS
+    } else if copy_differs_on() && IN_REFRESH.with(|r| r.get()) {
+        &ALL_DIFFERS
+    } else {
+        return;
+    };
+    thread_local! {
+        static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    TITLE.with(|t| {
+        let mut t = t.borrow_mut();
+        t.resize(n, 0);
+        if !crate::host::read_into(src as *const u8, &mut t[..n]) {
+            counters[3].fetch_add(1, Relaxed);
+            return;
+        }
+        // SAFETY: `dst` is the host copy's mapping of these `n` bytes.
+        let host = unsafe { std::slice::from_raw_parts(dst, n) };
+        let differ = host.iter().zip(&t[..n]).filter(|(a, b)| a != b).count() as u64;
+        counters[0].fetch_add(n as u64, Relaxed);
+        counters[1].fetch_add(differ, Relaxed);
+        if differ > 0 {
+            counters[2].fetch_add(1, Relaxed);
+        } else if counters.len() > 4 {
+            // A copy that changes nothing at all.
+            counters[4].fetch_add(1, Relaxed);
+            counters[5].fetch_add(n as u64, Relaxed);
+        }
+    });
+}
+
+#[cfg(feature = "diagnostics")]
+fn refresh_path_written(path: RefreshPath, written: bool) {
+    refresh_path(path);
+    REFRESH_WRITTEN.with(|w| w.set(written));
+}
+
+/// Per path: calls, bytes asked, bytes copied, microseconds; then, of the
+/// calls, those asking for a range of a copy asked already this frame,
+/// their bytes, and of them those that copied nothing.
+#[cfg(feature = "diagnostics")]
+static REFRESHES: [std::sync::atomic::AtomicU64; REFRESH_PATHS * 4 + 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; REFRESH_PATHS * 4 + 3];
+
+/// The frame and the ranges asked in it, by (copy, from, to).
+#[cfg(feature = "diagnostics")]
+type Asked = (u64, std::collections::HashSet<(usize, usize, usize)>);
+
+#[cfg(feature = "diagnostics")]
+static ASKED: Mutex<Option<Asked>> = Mutex::new(None);
+
+/// Diagnostics: ranges found clean at a [`crate::watch::fine_epoch`], by
+/// (copy, from, to).
+#[cfg(feature = "diagnostics")]
+type FineClean = std::collections::HashMap<(usize, usize, usize), u64>;
+
+#[cfg(feature = "diagnostics")]
+static FINE_CLEAN: Mutex<Option<FineClean>> = Mutex::new(None);
+
+/// Guarded refreshes a 1 MiB epoch would have skipped: calls, bytes asked,
+/// microseconds; and of them those that did copy (bytes the skip would
+/// have missed): calls, bytes.
+#[cfg(feature = "diagnostics")]
+static FINE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Counts what a 1 MiB epoch would have done with a refresh that took the
+/// way `path` at fine epoch `fine` (taken before it).
+#[cfg(feature = "diagnostics")]
+fn fine_counted(copy: usize, from: usize, to: usize, copied: usize, us: u64, path: u8, fine: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if path != RefreshPath::Clean as u8 && path != RefreshPath::Guarded as u8 {
+        return;
+    }
+    let mut map = FINE_CLEAN.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Default::default);
+    if path == RefreshPath::Guarded as u8 && map.get(&(copy, from, to)) == Some(&fine) {
+        FINE[0].fetch_add(1, Relaxed);
+        FINE[1].fetch_add((to - from) as u64, Relaxed);
+        FINE[2].fetch_add(us, Relaxed);
+        if copied > 0 {
+            FINE[3].fetch_add(1, Relaxed);
+            FINE[4].fetch_add(copied as u64, Relaxed);
+            if REFRESH_WRITTEN.with(|w| w.get()) {
+                FINE[5].fetch_add(1, Relaxed);
+                FINE[6].fetch_add(copied as u64, Relaxed);
+            }
+        }
+    }
+    if crate::watch::fine_epoch(from, to) == fine {
+        if map.len() >= 1 << 20 {
+            map.clear();
+        }
+        map.insert((copy, from, to), fine);
+    } else {
+        map.remove(&(copy, from, to));
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn refresh_counted(copy: usize, from: usize, to: usize, copied: usize, us: u64) -> u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let path = REFRESH_PATH.with(|p| p.replace(u8::MAX));
+    if usize::from(path) < REFRESH_PATHS {
+        let at = usize::from(path) * 4;
+        REFRESHES[at].fetch_add(1, Relaxed);
+        REFRESHES[at + 1].fetch_add((to - from) as u64, Relaxed);
+        REFRESHES[at + 2].fetch_add(copied as u64, Relaxed);
+        REFRESHES[at + 3].fetch_add(us, Relaxed);
+    }
+    let frame = crate::queue::presented();
+    let again = {
+        let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let (seen_frame, seen) = asked.get_or_insert_with(Default::default);
+        if *seen_frame != frame {
+            *seen_frame = frame;
+            seen.clear();
+        }
+        !seen.insert((copy, from, to))
+    };
+    if again {
+        let at = REFRESH_PATHS * 4;
+        REFRESHES[at].fetch_add(1, Relaxed);
+        REFRESHES[at + 1].fetch_add((to - from) as u64, Relaxed);
+        if copied == 0 {
+            REFRESHES[at + 2].fetch_add(1, Relaxed);
+        }
+    }
+    path
+}
+
+/// Diagnostics: the refresh paths since the last call, per frame, as a
+/// line; `None` without `VICTORY_COPY_COUNTS=1`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn refresh_paths_text(frames: f64) -> Option<String> {
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::backread::counts() {
+        return None;
+    }
+    let c: Vec<f64> = REFRESHES.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let mut line = String::from("refresh paths per frame:");
+    for (i, name) in ["clean", "guarded", "write-watched", "unwatched again", "unwatched"].iter().enumerate() {
+        let _ = write!(
+            line,
+            " {name} {:.0} calls {:.1} MB asked {:.2} MB copied {:.2} ms;",
+            c[i * 4],
+            c[i * 4 + 1] / 1e6,
+            c[i * 4 + 2] / 1e6,
+            c[i * 4 + 3] / 1e3
+        );
+    }
+    let at = REFRESH_PATHS * 4;
+    let _ = write!(
+        line,
+        " asked again this frame {:.0} calls {:.1} MB, {:.0} of them copied nothing",
+        c[at],
+        c[at + 1] / 1e6,
+        c[at + 2]
+    );
+    let v: Vec<f64> = CLEAN_CHECKED.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let _ = write!(
+        line,
+        "; found clean and checked all the same {:.0} calls, {:.1} of them copied, {:.3} MB",
+        v[0],
+        v[1],
+        v[2] / 1e6
+    );
+    let d: Vec<f64> = CLEAN_DIFFERS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let _ = write!(
+        line,
+        " (looked at {:.3} MB: {:.0} bytes differed from the host copy, in {:.1} copies; {:.1} unreadable)",
+        d[0] / 1e6,
+        d[1],
+        d[2],
+        d[3]
+    );
+    let o: Vec<f64> = ORIGIN_COPIES.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let _ = write!(line, "; copied pages by why they were noted written:");
+    for (i, name) in
+        ["never copied", "pinned", "read-only not clean", "found open", "GPU in place", "streamed", "edge part kept (not copied)"]
+            .iter()
+            .enumerate()
+    {
+        let _ = write!(
+            line,
+            " {name} {:.0} pages {:.1} MB ({:.0} pages {:.1} MB changed nothing);",
+            o[i * 4],
+            o[i * 4 + 1] / 1e6,
+            o[i * 4 + 2],
+            o[i * 4 + 3] / 1e6
+        );
+    }
+    let a: Vec<f64> = ALL_DIFFERS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let _ = write!(
+        line,
+        "; all refresh copies: looked at {:.3} MB, {:.3} MB differed from the host copy, {:.1} copies with a difference;          {:.1} copies changed nothing, {:.3} MB; {:.1} unreadable",
+        a[0] / 1e6,
+        a[1] / 1e6,
+        a[2],
+        a[4],
+        a[5] / 1e6,
+        a[3]
+    );
+    let f: Vec<f64> = FINE.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let _ = write!(
+        line,
+        "; a 1 MiB epoch would skip {:.0} guarded calls, {:.1} MB asked, {:.2} ms; of them {:.1} copied, {:.3} MB,          of those {:.1} with pages the guards reported written, {:.3} MB",
+        f[0],
+        f[1] / 1e6,
+        f[2] / 1e3,
+        f[3],
+        f[4] / 1e6,
+        f[5],
+        f[6] / 1e6
+    );
+    Some(line)
 }
 
 /// The sparse copy `[address, end)` lies in.
@@ -2727,6 +3192,68 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    /// Pages a range holds only in part are copied once, then again only
+    /// when written since, or for a part not copied yet; what is copied is
+    /// the title's bytes.
+    #[test]
+    fn a_page_copied_in_part_is_copied_again_only_when_written() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::Host::new_warp() else { return };
+        let len = 3 * PAGE;
+        // SAFETY: plain creation and mapping of an upload buffer of our own.
+        let (buffer, data) = unsafe {
+            let mut buffer: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer_desc(len as u64, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut buffer,
+                )
+                .unwrap();
+            let buffer = buffer.unwrap();
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).unwrap();
+            (buffer, data.cast::<u8>())
+        };
+        // SAFETY: a private region of our own, 64 KiB aligned.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        // SAFETY: the region is ours and writable.
+        unsafe { std::ptr::write_bytes(title as *mut u8, 7, len) };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, title as u64, len as u64, None);
+        let page0 = title / PAGE;
+        let (from, to) = (title + PAGE / 2, title + PAGE + PAGE / 2);
+        let held = |a: usize, b: usize| {
+            // SAFETY: both inside their mappings.
+            unsafe { std::slice::from_raw_parts(data.add(a - title), b - a) == std::slice::from_raw_parts(a as *const u8, b - a) }
+        };
+        // Two pages in part: copied.
+        assert_eq!(shadow.copy_stale(from, to, 1, &[]), PAGE);
+        assert!(held(from, to));
+        // Asked again, nothing written: nothing copied (before: both parts).
+        assert_eq!(shadow.copy_stale(from, to, 2, &[]), 0);
+        // The title writes the first page: only its part is copied again.
+        // SAFETY: our region.
+        unsafe { ((title + PAGE - 8) as *mut u8).write(9) };
+        assert_eq!(shadow.copy_stale(from, to, 3, &[(page0, 3)]), PAGE / 2);
+        assert!(held(from, to));
+        // Not written since: nothing.
+        assert_eq!(shadow.copy_stale(from, to, 4, &[(page0, 3)]), 0);
+        // A part of the first page not copied yet: copied.
+        // SAFETY: our region.
+        unsafe { ((title + 8) as *mut u8).write(5) };
+        assert_eq!(shadow.copy_stale(title, title + PAGE / 2, 5, &[(page0, 3)]), PAGE / 2);
+        assert!(held(title, title + PAGE / 2));
+        // SAFETY: our region, not used after.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
