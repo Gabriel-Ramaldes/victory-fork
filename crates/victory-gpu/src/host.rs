@@ -3470,6 +3470,7 @@ impl Meter {
                 ("back reads: ", crate::backread::report_text()),
                 ("", crate::backread::compare_text()),
                 ("", crate::backread::stacks_text()),
+                ("", crate::tilecmp::text()),
             ] {
                 if !line.is_empty() {
                     tracing::info!("{prefix}{line}");

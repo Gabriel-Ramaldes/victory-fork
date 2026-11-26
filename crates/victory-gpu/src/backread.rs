@@ -883,6 +883,14 @@ impl Tally {
         }
     }
 
+    /// Comparisons done ahead of the tiles, since `began`
+    /// (`crate::tilecmp`): their time is the comparing time.
+    pub(crate) fn compared(&mut self, began: Instant) {
+        if self.start.is_some() {
+            self.n[CMP_NS] += began.elapsed().as_nanos() as u64;
+        }
+    }
+
     /// A tile of `n` bytes compared identical (the comparison began at `t0`).
     pub(crate) fn same(&mut self, n: usize, t0: Option<Instant>) {
         let Some(t0) = t0 else { return };

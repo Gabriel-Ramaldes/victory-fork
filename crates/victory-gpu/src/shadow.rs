@@ -2014,6 +2014,26 @@ impl Shadow {
         let mut title: Option<Vec<u8>> = None;
         #[cfg(feature = "diagnostics")]
         let mut tally = crate::backread::Tally::new(0);
+        // Diagnostics experiment (`VICTORY_BACK_COMPARE`): the tiles'
+        // comparisons first, on kept threads, under the same lock; the loop
+        // below takes their answers in order (`crate::tilecmp` says why
+        // they are the serial ones).
+        #[cfg(feature = "diagnostics")]
+        let mut wide = (crate::tilecmp::workers() > 0).then(|| {
+            let began = std::time::Instant::now();
+            let mut tiles = Vec::new();
+            self.each_tile(s, address, address + len, |at, data, n| {
+                if let Some(old) = before.get(&(((at - start) / PAGE) as u32)) {
+                    tiles.push((data as usize, old[at % PAGE..].as_ptr() as usize, n));
+                }
+            });
+            // SAFETY: the tiles' memory and snapshots stay, and nothing
+            // writes them, while `before` is held, which it is until this
+            // call returns.
+            let found = unsafe { crate::tilecmp::differ(tiles) };
+            tally.compared(began);
+            found.into_iter()
+        });
         self.each_tile(s, address, address + len, |at, data, n| {
             let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
                 return;
@@ -2025,7 +2045,14 @@ impl Shadow {
             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             let t0 = tally.tile_start();
-            if host == old {
+            #[cfg(feature = "diagnostics")]
+            let same = match wide.as_mut() {
+                Some(found) => found.next().map_or_else(|| host == old, |differs| !differs),
+                None => host == old,
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let same = host == old;
+            if same {
                 #[cfg(feature = "diagnostics")]
                 tally.same(n, t0);
                 return;
