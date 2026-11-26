@@ -327,7 +327,8 @@ Overhead e limites desta medição:
   ligados das etapas anteriores**, não desta. A etapa de cópias foi de 53
   (base) para 58-62 ms com `copied()` (`f32d849`) e para 72 ms com
   `retaken()` (`dad44fc`, mutex por tile). Esses contadores deveriam
-  passar a ser opcionais antes de novos A/B de tempo.
+  passar a ser opcionais antes de novos A/B de tempo. Desde `6f7f4c1` eles
+  só contam com `VICTORY_COPY_COUNTS=1` (só no diag, desligado por padrão).
 - **A cena variou entre as rodadas** (3.800 draws contra 5.000 na base),
   então volumes absolutos de MB por quadro não são estritamente
   comparáveis entre elas.
