@@ -252,6 +252,40 @@ struct Views {
 
 static VIEWS: Mutex<Option<Views>> = Mutex::new(None);
 
+/// The run of views holding `[at, end)` whose pages follow one another
+/// both here and in one section, within `[low, high)`: its start and end,
+/// the section, and the section offset at the start. `None` where no such
+/// run holds all of the range (a gap, another section, or pages out of
+/// order in it). Only views the runtime reported are known
+/// ([`title_memory_view`], so not with `VICTORY_VIEW_GUARD=0`).
+pub(crate) fn run_of_views(at: usize, end: usize, low: usize, high: usize) -> Option<(usize, usize, usize, u64)> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = views.as_ref()?;
+    let (&first, &(len, section, offset)) = views.by_addr.range(..=at).next_back()?;
+    if first + len <= at || first < low || first + len > high {
+        return None;
+    }
+    // Up from the view holding `at`, then down from it.
+    let (mut stop, mut next) = (first + len, offset + len as u64);
+    for (&a, &(n, s, o)) in views.by_addr.range(stop..high) {
+        if a != stop || s != section || o != next || a + n > high {
+            break;
+        }
+        (stop, next) = (a + n, o + n as u64);
+    }
+    if stop < end {
+        return None;
+    }
+    let (mut start, mut from) = (first, offset);
+    for (&a, &(n, s, o)) in views.by_addr.range(low..first).rev() {
+        if a + n != start || s != section || o + n as u64 != from {
+            break;
+        }
+        (start, from) = (a, o);
+    }
+    Some((start, stop, section, from))
+}
+
 /// Whether all the views of a guarded page are guarded together.
 fn view_guard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -857,6 +891,65 @@ pub fn title_memory_written(at: usize, len: usize) {
     }
 }
 
+/// The host GPU wrote title memory `[at, at + len)` in place (a window on
+/// the title's own pages, not a copy): copies of those pages, here and at
+/// their other views, take them again. Nothing's protection changes, as no
+/// thread wrote: a guarded block noted not clean is reported written at its
+/// next check ([`guard`]) without a kernel call, and the journal and the
+/// region epochs tell the copies that are not guarded.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let mut blocks: Vec<usize> = (first..last).collect();
+    if view_guard()
+        && let Some(views) = VIEWS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+    {
+        for block in first..last {
+            let shown = views.shown(block * BLOCK);
+            if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                continue;
+            }
+            blocks.extend(shown.iter().map(|a| a / BLOCK).filter(|&b| b != block));
+        }
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    {
+        let mut g = guards();
+        for block in &blocks {
+            g.clean.remove(block);
+        }
+    }
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.asked += 1;
+        let now = j.asked;
+        for block in &blocks {
+            for page in block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE {
+                j.written.insert(page, now);
+            }
+        }
+    }
+    // Runs of blocks next to one another, one bump each.
+    let mut run: Option<(usize, usize)> = None;
+    for &block in &blocks {
+        run = match run {
+            Some((from, to)) if to == block => Some((from, block + 1)),
+            Some((from, to)) => {
+                bump_region_epochs(from * BLOCK, to * BLOCK);
+                Some((block, block + 1))
+            }
+            None => Some((block, block + 1)),
+        };
+    }
+    if let Some((from, to)) = run {
+        bump_region_epochs(from * BLOCK, to * BLOCK);
+    }
+}
+
 /// Opens a guarded block at `at` (or returns `true` if another thread already
 /// made it read-write). Called both by our own VEH handler and by
 /// `host::safe_copy`'s VEH handler on write faults.
@@ -992,6 +1085,72 @@ mod tests {
         assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()));
         drop_views(&[guarded, other]);
+    }
+
+    /// A run of views is views next to one another both here and in one
+    /// section; a step out of order in the section, another section, a gap,
+    /// or the edge of the reach ends it.
+    #[test]
+    fn views_make_a_run_when_they_follow_here_and_in_their_section() {
+        let base = 0x7b00_0000_0000usize;
+        let (section, other) = (0x61, 0x62);
+        let reach = 1usize << 30;
+        let (low, high) = (base, base + reach);
+        // Three in order, then one out of order in the section, then one of
+        // another section, then a gap and one more.
+        for k in 0..3 {
+            title_memory_view(base + k * BLOCK, BLOCK, section, (k * BLOCK) as u64);
+        }
+        title_memory_view(base + 3 * BLOCK, BLOCK, section, (7 * BLOCK) as u64);
+        title_memory_view(base + 4 * BLOCK, BLOCK, other, (8 * BLOCK) as u64);
+        title_memory_view(base + 6 * BLOCK, BLOCK, section, (9 * BLOCK) as u64);
+        assert_eq!(
+            run_of_views(base + BLOCK + 16, base + 2 * BLOCK + 32, low, high),
+            Some((base, base + 3 * BLOCK, section, 0))
+        );
+        // From the middle of a run, the offset is the run's first page's.
+        assert_eq!(
+            run_of_views(base + 2 * BLOCK, base + 2 * BLOCK + 1, low, high),
+            Some((base, base + 3 * BLOCK, section, 0))
+        );
+        assert_eq!(
+            run_of_views(base + 3 * BLOCK, base + 4 * BLOCK, low, high),
+            Some((base + 3 * BLOCK, base + 4 * BLOCK, section, (7 * BLOCK) as u64))
+        );
+        // Across the step out of order, across sections, across the gap.
+        assert_eq!(run_of_views(base + 2 * BLOCK, base + 3 * BLOCK + 1, low, high), None);
+        assert_eq!(run_of_views(base + 3 * BLOCK, base + 4 * BLOCK + 1, low, high), None);
+        assert_eq!(run_of_views(base + 5 * BLOCK, base + 5 * BLOCK + 1, low, high), None);
+        // The reach cuts the run.
+        assert_eq!(
+            run_of_views(base + 2 * BLOCK, base + 2 * BLOCK + 1, base + BLOCK, high),
+            Some((base + BLOCK, base + 3 * BLOCK, section, BLOCK as u64))
+        );
+        assert_eq!(run_of_views(base, base + 1, low, base + 2 * BLOCK), Some((base, base + 2 * BLOCK, section, 0)));
+        title_memory_view_gone(base, 7 * BLOCK);
+        assert_eq!(run_of_views(base, base + 1, low, high), None);
+    }
+
+    /// A write of the host GPU in place is reported at the range and at the
+    /// other views of its pages, and leaves every protection as it was.
+    #[test]
+    fn a_gpu_write_in_place_is_reported_at_every_view_of_its_pages() {
+        let base = 0x7c00_0000_0000usize;
+        let section = 0x71;
+        title_memory_view(base, BLOCK, section, 0);
+        title_memory_view(base + 8 * BLOCK, BLOCK, section, 0);
+        let asked = JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked;
+        guards().clean.insert(base / BLOCK);
+        guards().clean.insert(base / BLOCK + 8);
+        gpu_wrote(base + 16, 32);
+        for at in [base, base + 8 * BLOCK] {
+            let stamp = JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&(at / PAGE)).copied();
+            assert!(stamp.is_some_and(|w| w > asked), "{at:#x} not reported written");
+            assert!(!guards().clean.contains(&(at / BLOCK)), "{at:#x} still clean");
+        }
+        // Not the blocks around.
+        assert!(!JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&(base / PAGE + 1)).is_some_and(|&w| w > asked));
+        title_memory_view_gone(base, 9 * BLOCK);
     }
 
     /// Both views have copies: a write through either is reported at both.

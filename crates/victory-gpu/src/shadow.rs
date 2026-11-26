@@ -64,6 +64,10 @@ struct Direct {
     aliases: Mutex<Vec<(u64, Arc<Shadow>)>>,
     /// The title mapped other memory there since.
     dead: std::sync::atomic::AtomicBool,
+    /// Opened through a view of ours on a run of the title's 64 KiB views
+    /// ([`through_another_view`]): the same pages are shown at other title
+    /// addresses too, whose copies are told of the GPU's writes.
+    stretch: bool,
 }
 
 #[derive(Default)]
@@ -454,7 +458,11 @@ impl Shadow {
                 if let Some((_, s)) = aliases.iter().find(|(b, _)| *b == base) {
                     return Some(s.clone());
                 }
-                let made = Arc::new(placed(&direct.heap, base - first, base, first + self.len - base)?);
+                let mut made = placed(&direct.heap, base - first, base, first + self.len - base)?;
+                if let Some(d) = made.direct.as_mut() {
+                    d.stretch = direct.stretch;
+                }
+                let made = Arc::new(made);
                 aliases.push((base, made.clone()));
                 return Some(made);
             }
@@ -480,7 +488,12 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        if self.direct.is_some() {
+        if let Some(d) = &self.direct {
+            // Nothing to copy back; a window on a run of views has its other
+            // views told after the submission ([`Shadow::copy_back`]).
+            if d.stretch {
+                list.defer_gpu_write(self, address as usize, len.min(self.left(address)) as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -552,7 +565,17 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        if self.direct.is_some() || self.card.is_some() {
+        if let Some(d) = &self.direct {
+            // The GPU wrote the title's pages themselves; where they are
+            // shown at other addresses too, copies made there take the
+            // range again, as after a copy back's write.
+            // shortcut: the whole declared range, not what was written.
+            if d.stretch && !d.dead.load(Ordering::Acquire) {
+                crate::watch::gpu_wrote(address, len);
+            }
+            return 0;
+        }
+        if self.card.is_some() {
             return 0;
         }
         if let Some((root, s)) = self.sparse_root() {
@@ -1066,6 +1089,7 @@ fn placed(
             heap: heap.clone(),
             aliases: Mutex::default(),
             dead: std::sync::atomic::AtomicBool::new(false),
+            stretch: false,
         }),
         unwatched: Mutex::default(),
         clean_spans: Mutex::default(),
@@ -1191,6 +1215,7 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
             }
         }
     });
+    let window = window.or_else(|| through_another_view(device, address, end));
     let Some(window) = window else {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1232,7 +1257,105 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         );
     }
     let window = Arc::new(window);
-    map.insert(window.start, window.clone());
+    // A longer run from the same start takes a shorter one's place; lists
+    // made before may still use that one.
+    if let Some(before) = map.insert(window.start, window.clone()) {
+        crate::host::retire(before);
+    }
+    Some(window)
+}
+
+/// Runs of views shorter than this are copied: each window is a host heap.
+const STRETCH_LEAST: u64 = 4 << 20;
+
+/// Whether runs of views are used in place (`VICTORY_STRETCH=0` copies
+/// them, as before).
+fn stretch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0");
+        tracing::info!(on, "runs of title views used in place through views of ours");
+        on
+    })
+}
+
+/// A window on title memory the title shows in 64 KiB views, each its own
+/// allocation, which the host cannot open as one heap: where the views
+/// follow one another in their section too (`watch::run_of_views`; the
+/// streaming heaps of Grand Theft Auto VI, 75 MiB in 1,200 views), the run
+/// of the section is mapped once more, whole, at an address of ours, and
+/// the host heap is opened there. The same pages: nothing is copied either
+/// way, and the title's views stay as they are. When the title maps other
+/// memory in the run the window dies as any other ([`remapped`]).
+/// shortcut: the view of ours is never unmapped (address space only; the
+/// pages are the section's), as dead windows are kept.
+fn through_another_view(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device13,
+    address: u64,
+    end: u64,
+) -> Option<Shadow> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Heap;
+    use windows_sys::Win32::System::Memory::{
+        FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+    };
+    if !stretch_on() {
+        return None;
+    }
+    let low = address & !(WINDOW_REACH - 1);
+    let high = low.checked_add(WINDOW_REACH)?;
+    if end > high {
+        return None;
+    }
+    let (start, stop, section, offset) =
+        crate::watch::run_of_views(address as usize, end as usize, low as usize, high as usize)?;
+    let len = stop - start;
+    if (len as u64) < STRETCH_LEAST {
+        return None;
+    }
+    // SAFETY: a section the runtime reported with live views of it; the
+    // run lies inside it.
+    let view = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, len) };
+    if view.Value.is_null() {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            start = format_args!("{start:#x}"),
+            len,
+            "a run of title views could not be mapped again"
+        );
+        return None;
+    }
+    // Read-only guards would refuse the GPU's writes.
+    crate::watch::writing(start, len);
+    // SAFETY: committed pages of our view; the heap keeps them.
+    let heap: Result<ID3D12Heap, _> = unsafe { device.OpenExistingHeapFromAddress1(view.Value, len) };
+    let window = match heap {
+        Ok(heap) => placed(&heap, 0, start as u64, len as u64),
+        Err(error) => {
+            tracing::warn!(%error, start = format_args!("{start:#x}"), len, "a run of title views refused by the host GPU");
+            None
+        }
+    };
+    let Some(mut window) = window else {
+        // SAFETY: our view, used by nothing now.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value }) };
+        return None;
+    };
+    if let Some(d) = window.direct.as_mut() {
+        d.stretch = true;
+    }
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+    if count <= 32 || count.is_power_of_two() {
+        tracing::info!(
+            count,
+            mapped_mib = bytes >> 20,
+            start = format_args!("{start:#x}"),
+            len,
+            "a run of title views in place through a view of ours"
+        );
+    }
     Some(window)
 }
 
