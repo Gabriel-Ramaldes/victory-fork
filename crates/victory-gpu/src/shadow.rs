@@ -1412,6 +1412,11 @@ pub(crate) fn filled(start: u64, end: u64) {
 }
 
 /// The title mapped or unmapped memory in `[start, end)`.
+/// Bumped each time a remap marks direct windows dead, after marking
+/// them: a bindless heap only looks for slots on dead windows when it
+/// changed ([`crate::descriptor::host`]).
+pub(crate) static DEAD_WINDOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
@@ -1437,6 +1442,7 @@ pub(crate) fn remapped(start: u64, end: u64) {
                     d.dead.store(true, Ordering::Release);
                 }
             }
+            DEAD_WINDOWS.fetch_add(1, Ordering::AcqRel);
         }
         // shortcut: kept for good, pages too (`GONE` names its buffers by
         // address); drop them with their last view if the title remaps much.

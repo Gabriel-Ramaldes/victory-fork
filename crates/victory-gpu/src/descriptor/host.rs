@@ -181,6 +181,9 @@ struct Bindless {
     unmapped_slots: std::collections::HashSet<u32>,
     /// Subset of `uses` holding a direct-memory window (checked for `is_dead`).
     direct_slots: std::collections::HashSet<u32>,
+    /// [`crate::shadow::DEAD_WINDOWS`] when `direct_slots` was last looked
+    /// through; `u64::MAX` when a slot came in on a window already dead.
+    dead_seen: u64,
     /// The released-view, placed-texture, and memory-remap epochs `uses` was checked at.
     checked: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
@@ -1675,7 +1678,11 @@ impl HostHeap {
                     }
                 }
             }
-            if viewed || mem_changed {
+            // Windows die only on a remap, which counts them: without one
+            // since the last look, no slot here is on a dead window.
+            let dead = crate::shadow::DEAD_WINDOWS.load(Ordering::Acquire);
+            if (viewed || mem_changed) && b.dead_seen != dead {
+                b.dead_seen = dead;
                 for &i in &b.direct_slots {
                     if b.uses
                         .get(&i)
@@ -1686,6 +1693,8 @@ impl HostHeap {
                         dirty.insert(i);
                     }
                 }
+            }
+            if viewed || mem_changed {
                 for &i in &b.unmapped_slots {
                     if let Some(u) = b.uses.get(&i)
                         && (cfg!(test)
@@ -1771,7 +1780,10 @@ impl HostHeap {
                     } else {
                         b.unmapped_slots.remove(&index);
                     }
-                    if u.direct.is_some() {
+                    if let Some(s) = &u.direct {
+                        if s.is_dead() {
+                            b.dead_seen = u64::MAX;
+                        }
                         b.direct_slots.insert(index);
                     } else {
                         b.direct_slots.remove(&index);
