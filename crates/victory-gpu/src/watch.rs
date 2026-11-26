@@ -304,7 +304,7 @@ impl Views {
 
 /// Every address the page of the block at `at` is shown at (see
 /// [`Views::shown`]).
-fn aliases(at: usize) -> Vec<usize> {
+pub(crate) fn aliases(at: usize) -> Vec<usize> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     views.as_ref().map_or(Vec::new(), |v| v.shown(at - at % BLOCK).to_vec())
 }

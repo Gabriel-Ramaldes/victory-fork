@@ -1468,6 +1468,8 @@ impl Host {
                     let bytes = rb.row_bytes * rb.lines;
                     crate::watch::writing(rb.dst, bytes);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, bytes);
+                    #[cfg(feature = "diagnostics")]
+                    crate::backread::copied(rb.dst, bytes, crate::backread::Kind::Readback);
                     bytes
                 } else {
                     let mut n = 0;
@@ -1476,6 +1478,8 @@ impl Host {
                         let from = rb.src + line * rb.src_pitch;
                         crate::watch::writing(to, rb.row_bytes);
                         write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
+                        #[cfg(feature = "diagnostics")]
+                        crate::backread::copied(to, rb.row_bytes, crate::backread::Kind::Readback);
                         n += rb.row_bytes;
                     }
                     n
@@ -3460,6 +3464,15 @@ impl Meter {
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
             tracing::info!("{}", crate::shadow::paths_text());
+            #[cfg(feature = "diagnostics")]
+            tracing::info!("back reads: {}", crate::backread::report_text());
+            #[cfg(feature = "diagnostics")]
+            {
+                let stacks = crate::backread::stacks_text();
+                if !stacks.is_empty() {
+                    tracing::info!("{stacks}");
+                }
+            }
             #[cfg(feature = "diagnostics")]
             log_gpu_waits();
             #[cfg(feature = "diagnostics")]

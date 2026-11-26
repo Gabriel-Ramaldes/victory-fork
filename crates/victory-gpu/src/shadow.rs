@@ -348,6 +348,8 @@ impl Shadow {
                         title_slice[dirty_start..].as_ptr(),
                         dirty_len,
                     );
+                    #[cfg(feature = "diagnostics")]
+                    crate::backread::copied(title_addr + dirty_start, dirty_len, crate::backread::Kind::Shadow);
                     written += dirty_len;
                 }
                 if cpu_modified {
@@ -603,6 +605,8 @@ impl Shadow {
                                 title_slice[dirty_start..].as_ptr(),
                                 dirty_len,
                             );
+                            #[cfg(feature = "diagnostics")]
+                            crate::backread::copied(start + at + dirty_start, dirty_len, crate::backread::Kind::Shadow);
                             written += dirty_len;
                         }
                         synced.push((start + at) / PAGE);
@@ -2013,6 +2017,8 @@ impl Shadow {
                     buf[dirty_start..].as_ptr(),
                     dirty_len,
                 );
+                #[cfg(feature = "diagnostics")]
+                crate::backread::copied(at + dirty_start, dirty_len, crate::backread::Kind::Shadow);
                 written += dirty_len;
             }
         });
