@@ -1152,7 +1152,6 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            #[cfg(feature = "diagnostics")]
             if !host_pads() {
                 return None;
             }
@@ -1185,10 +1184,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1229,7 +1225,8 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// In every build, so release runs can be measured unattended; nothing
+    /// happens without the variable.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1252,7 +1249,6 @@ mod host {
             .collect()
     }
 
-    #[cfg(feature = "diagnostics")]
     fn key_named(name: &str) -> Option<u8> {
         Some(match name {
             "Enter" => 0x0D,
@@ -1272,7 +1268,6 @@ mod host {
 
     /// Debugging aid: keys as in `VICTORY_KEYS`, one per line of the file
     /// `VICTORY_KEYS_FILE`, each held for 0.2 s once its line is there.
-    #[cfg(feature = "diagnostics")]
     fn asked() -> Option<u8> {
         struct Asked {
             looked: Instant,
@@ -1314,7 +1309,6 @@ mod host {
     /// `VICTORY_KEYS`, drives the title while a pad is connected (the stand-in
     /// is there only while no host pad is; an unattended run with a pad left
     /// on never left the start screen, 2026-11-25).
-    #[cfg(feature = "diagnostics")]
     fn host_pads() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_HOST_PADS").is_none_or(|v| v != "0"));

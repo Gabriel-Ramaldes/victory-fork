@@ -42,3 +42,10 @@ Build diag, `data-gf`, async e STRETCH ligados, `VICTORY_SKIP_MOVIES=end`, uma r
 
 - A rodada `gf-1` (release, ~3950 draws) não serve mais de base. As rodadas com o `data-gf-snap` atual ficam entre 5000 e 13000 draws.
 - Até o commit seguinte, o `VICTORY_KEYS` só funcionava no build diag. No release, a tela de conta ("PLAYER A") esperava um toque, e o `VICTORY_HOST_PADS=0` não tinha efeito.
+
+## `VICTORY_KEYS` no release
+
+- **O que mudou:** `VICTORY_KEYS`, `VICTORY_KEYS_FILE` e `VICTORY_HOST_PADS` deixaram de ser exclusivos do build diag (`gameinput.rs`). Sem as variáveis definidas, nada muda.
+- **Por quê:** as rodadas de medição no release agora passam sozinhas da tela de conta.
+- **Como foi conferido:** uma rodada release de 130 s com `VICTORY_HOST_PADS=0` e `VICTORY_KEYS=56:Enter` pulou o vídeo às 16:13:59 e chegou ao mundo, com até 12822 draws.
+- **Como foram usados:** só na tela de conta. Termos e privacidade continuam sendo aceitos pelo usuário.
