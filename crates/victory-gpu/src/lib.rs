@@ -91,6 +91,6 @@ pub use host::on_failure;
 pub use memstat::report as memory_report;
 #[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_remapped, title_memory_view, title_memory_view_gone, title_memory_written,
-    writing as kernel_will_write,
+    Writing as KernelWriting, title_memory_committed, title_memory_remapped, title_memory_view, title_memory_view_gone,
+    title_memory_written, writing_held as kernel_writing,
 };

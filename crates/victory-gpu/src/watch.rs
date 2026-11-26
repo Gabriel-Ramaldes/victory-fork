@@ -211,12 +211,46 @@ struct Guards {
     /// Blocks whose page was guarded together with its other views (those
     /// views' blocks are in it too): a write to one opens them all.
     aliased: BTreeSet<usize>,
-    /// Blocks the kernel is about to write for the runtime ([`writing`]),
-    /// from, to, and until when they are left writable: a read may be
-    /// asynchronous and land after the call that asked for it returned, and
-    /// the kernel does not fault into our handler, it fails. Until then
-    /// they are not made read-only, and every check reports them written.
-    pins: Vec<(usize, usize, std::time::Instant)>,
+    /// Blocks something is about to write without faulting into our
+    /// handler (the kernel, our own copies, the host GPU), from, to, and
+    /// until when they are left writable. Until then they are not made
+    /// read-only, and every check reports them written.
+    pins: Vec<(usize, usize, Until)>,
+}
+
+/// Until when a pin holds ([`Guards::pins`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Until {
+    /// A time ([`writing`]: windows of the host GPU on title memory).
+    Time(std::time::Instant),
+    /// As long as a [`Writing`] lives: a write that ends when its caller
+    /// is done (our copies, synchronous reads of the kernel).
+    Held(u64),
+    /// Until the asynchronous read whose `OVERLAPPED` is at this address
+    /// has completed ([`Writing::until_done`]), with the held pin's number.
+    Done(u64, usize),
+}
+
+/// An `OVERLAPPED`'s status while its operation is in flight.
+const STATUS_PENDING: usize = 0x103;
+
+/// Whether the operation of the `OVERLAPPED` at `at` is still in flight:
+/// its status (the first word) is pending. Read so that a page let go of
+/// reads as done: the title may free the structure only once it completed.
+fn pending(at: usize) -> bool {
+    let mut word = [0u8; size_of::<usize>()];
+    crate::host::read_into(at as *const u8, &mut word) && usize::from_ne_bytes(word) == STATUS_PENDING
+}
+
+impl Until {
+    /// Whether the pin still holds at `now`.
+    fn holds(&self, now: std::time::Instant) -> bool {
+        match *self {
+            Until::Time(until) => until > now,
+            Until::Held(_) => true,
+            Until::Done(_, overlapped) => pending(overlapped),
+        }
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -235,6 +269,30 @@ impl Guards {
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
     }
+
+    /// Lets go of the pins that ended at `now`.
+    fn unpin_ended(&mut self, now: std::time::Instant) {
+        #[cfg(feature = "diagnostics")]
+        let mut done = 0u64;
+        self.pins.retain(|(_, _, until)| {
+            let holds = until.holds(now);
+            #[cfg(feature = "diagnostics")]
+            if !holds && matches!(until, Until::Done(..)) {
+                done += 1;
+            }
+            holds
+        });
+        #[cfg(feature = "diagnostics")]
+        if done != 0 {
+            crate::copystat::add(crate::copystat::C::PinsAsyncDone, done);
+        }
+    }
+}
+
+/// How many pins hold now (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pins_alive() -> usize {
+    guards().pins.len()
 }
 
 /// Views of one page past which its views are not guarded together (the
@@ -497,24 +555,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let mut g = guards();
         if g.protected.contains(&first) || g.holes.contains(&first) {
-            let mut written = Vec::new();
-            let mut run: Option<usize> = None;
-            for block in first..=last {
-                let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
-                if open {
-                    if g.protected.contains(&block) {
-                        g.clean.insert(block);
-                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                    } else {
-                        run.get_or_insert(block);
-                        continue;
-                    }
-                }
-                if let Some(from) = run.take() {
-                    protect(&mut g, from, block, &mut written);
-                }
-            }
-            return Some(written);
+            return Some(walk(&mut g, first, last, false));
         }
     }
     // Slow path (first encounter): `start` is itself a mapped view, or if
@@ -528,9 +569,19 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let check_each = probe != start;
     install();
     let mut g = guards();
+    Some(walk(&mut g, first, last, check_each))
+}
+
+/// [`guard`]'s look at blocks `[first, last)`, under the guards' lock: the
+/// pages of the blocks written since they were last guarded, guarding the
+/// open ones again. A pinned block ([`writing`]) is left writable and
+/// reported written, wherever it lies in the range (it was protected again
+/// when the range began with a guarded block, before 2026-11-26, and the
+/// kernel's write into it then failed). With `check_each`, blocks are
+/// looked at only where something is mapped.
+fn walk(g: &mut Guards, first: usize, last: usize, check_each: bool) -> Vec<usize> {
     if !g.pins.is_empty() {
-        let now = std::time::Instant::now();
-        g.pins.retain(|&(_, _, until)| until > now);
+        g.unpin_ended(std::time::Instant::now());
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -556,10 +607,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block, &mut written);
+            protect(g, from, block, &mut written);
         }
     }
-    Some(written)
+    written
 }
 
 /// Scans `[start, end)` jumping over unmapped holes; returns the first
@@ -770,19 +821,93 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     true
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+/// Gives write access back to the guarded blocks of `[at, at + len)` for
+/// [`PIN`], for a writer whose writes go on after the call (the host GPU
+/// through a window on title memory). The same pages at their other views
+/// are opened too: every guard over them must copy them again. A write
+/// that ends when its caller is done takes [`writing_held`] instead.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
     #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PinsTimed, 1);
+    pin(at, len, Until::Time(std::time::Instant::now() + PIN));
+}
+
+/// A write into title memory that does not fault into our handler, in
+/// progress ([`writing_held`]): its blocks stay writable, and are reported
+/// written at every check, until it is dropped, or for an asynchronous
+/// read until that completed ([`Writing::until_done`]).
+#[must_use = "the blocks are guarded again when it is dropped"]
+pub struct Writing {
+    number: u64,
+    range: (usize, usize),
+    #[cfg(feature = "diagnostics")]
+    began: std::time::Instant,
+}
+
+/// Before a write into title memory `[at, at + len)` that does not fault
+/// into our handler (the kernel reading a file into it, our copies of what
+/// the host GPU wrote): opens its guarded blocks, here and at the other
+/// views of their pages, and keeps them writable while the result lives.
+pub fn writing_held(at: usize, len: usize) -> Writing {
+    static NUMBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let number = NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if len != 0 {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PinsHeld, 1);
+        pin(at, len, Until::Held(number));
+    }
+    Writing {
+        number,
+        range: (at, at + len),
+        #[cfg(feature = "diagnostics")]
+        began: std::time::Instant::now(),
+    }
+}
+
+impl Writing {
+    /// The write is an asynchronous read that is still in flight, whose
+    /// `OVERLAPPED` is at `overlapped`: its blocks stay writable until the
+    /// read completed (its status is no longer pending), not when this
+    /// returns.
+    pub fn until_done(self, overlapped: *const std::ffi::c_void) {
+        let this = std::mem::ManuallyDrop::new(self);
+        let mut g = guards();
+        for pin in g.pins.iter_mut().filter(|p| p.2 == Until::Held(this.number)) {
+            pin.2 = Until::Done(this.number, overlapped as usize);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PinsAsync, 1);
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        let (at, end) = self.range;
+        if at == end {
+            return;
+        }
+        // The blocks are left open and not clean: their next check guards
+        // them again and reports them written. No region epoch is bumped
+        // here: a range is noted clean (`Shadow::clean_spans`) only by a
+        // check that guarded all its blocks, so opening them bumped it
+        // already, and a check while they were pinned bumped it again.
+        guards().pins.retain(|p| p.2 != Until::Held(self.number));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PinHeldUs, self.began.elapsed().as_micros() as u64);
+    }
+}
+
+/// Pins the blocks of `[at, at + len)` and the same pages at their other
+/// views until `until`, and opens them.
+fn pin(at: usize, len: usize, until: Until) {
+    #[cfg(feature = "diagnostics")]
     crate::backread::announced(at, len);
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
-    let until = std::time::Instant::now() + PIN;
     g.pins.push((first, last, until));
     open(&mut g, at, at + len);
     if !view_guard() {
@@ -1279,6 +1404,246 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// One view of `blocks` blocks of a pagefile section, told as the
+    /// runtime tells it.
+    fn one_view(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section, mapped read-write once.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize;
+            assert_ne!(view, 0);
+            title_memory_view(view, blocks * BLOCK, section as usize, 0);
+            unpin(view, blocks);
+            view
+        }
+    }
+
+    /// Lets go of pins over `[view, view + blocks)`: another test's pins
+    /// last two seconds, and the address may be one it unmapped.
+    fn unpin(view: usize, blocks: usize) {
+        let (from, to) = (view / BLOCK, view / BLOCK + blocks);
+        guards().pins.retain(|&(a, b, _)| b <= from || to <= a);
+    }
+
+    fn drop_view(view: usize, blocks: usize) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        unpin(view, blocks);
+        title_memory_remapped(view, blocks * BLOCK);
+        title_memory_view_gone(view, blocks * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    }
+
+    /// The kernel writes `bytes` at `at` (`ReadFile` from a temporary
+    /// file): true if it could, which it cannot into a read-only block.
+    fn kernel_reads_into(at: usize, bytes: &[u8]) -> bool {
+        use std::io::{Read, Seek, Write};
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        file.rewind().unwrap();
+        // SAFETY: test memory of ours, nothing else refers to it.
+        let into = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, bytes.len()) };
+        file.read(into).is_ok_and(|n| n == bytes.len())
+    }
+
+    /// The pages of blocks `[from, to)` of `view`.
+    fn pages_of(view: usize, from: usize, to: usize) -> Vec<usize> {
+        ((view + from * BLOCK) / PAGE..(view + to * BLOCK) / PAGE).collect()
+    }
+
+    /// A block pinned for a kernel write in the middle of a range whose
+    /// first block is guarded (the check's fast path) stays writable and is
+    /// reported written at every check, also where a check covers only part
+    /// of the pin; the blocks around it are guarded as before.
+    #[test]
+    fn a_pinned_block_inside_a_guarded_range_stays_writable() {
+        let view = one_view(4);
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(pages_of(view, 0, 4)));
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(Vec::new()), "nothing written yet");
+        // Blocks 1 and 2 are about to be written by the kernel.
+        writing(view + BLOCK + 100, BLOCK);
+        // Block 0 guarded: the fast path, with the pin inside.
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(pages_of(view, 1, 3)));
+        assert!(kernel_reads_into(view + BLOCK + 100, b"from the disk"), "pinned blocks stay writable");
+        assert!(kernel_reads_into(view + 2 * BLOCK + 8, b"and more"), "pinned blocks stay writable");
+        // Reported again while pinned, here over half of the pin.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 1, 2)));
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(pages_of(view, 1, 3)));
+        {
+            let g = guards();
+            let at = view / BLOCK;
+            assert!(g.protected.contains(&at) && g.protected.contains(&(at + 3)));
+            assert!(!g.protected.contains(&(at + 1)) && !g.protected.contains(&(at + 2)));
+            assert!(!g.clean.contains(&(at + 1)) && !g.clean.contains(&(at + 2)));
+        }
+        // The blocks around it are still guarded: a store faults, is
+        // opened by the handler and is reported.
+        // SAFETY: our view; the handler opens it on the fault.
+        unsafe { ((view + 3 * BLOCK + 4) as *mut u8).write(9) };
+        assert_eq!(guard(view, view + 4 * BLOCK), Some([pages_of(view, 1, 3), pages_of(view, 3, 4)].concat()));
+        // SAFETY: the bytes the kernel put in.
+        assert_eq!(unsafe { std::slice::from_raw_parts((view + BLOCK + 100) as *const u8, 13) }, b"from the disk");
+        drop_view(view, 4);
+    }
+
+    /// A kernel write announced at one view pins the page at its other
+    /// views too: a check of another view, by its fast path, leaves it
+    /// writable there and reports it.
+    #[test]
+    fn a_pinned_page_stays_writable_at_its_other_views() {
+        let (one, two) = two_views();
+        unpin(one, 2);
+        unpin(two, 2);
+        // Guarding the first view makes the second read-only too.
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(pages_of(one, 0, 2)));
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(pages_of(two, 0, 2)));
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(Vec::new()));
+        writing(one + BLOCK + 100, 13);
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(pages_of(two, 1, 2)));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(pages_of(one, 1, 2)));
+        assert!(kernel_reads_into(two + BLOCK + 100, b"through two"), "the alias stays writable");
+        assert!(kernel_reads_into(one + BLOCK + 200, b"through one"), "the view stays writable");
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(pages_of(two, 1, 2)));
+        // SAFETY: the bytes the kernel put in, through the other view.
+        assert_eq!(unsafe { std::slice::from_raw_parts((one + BLOCK + 100) as *const u8, 11) }, b"through two");
+        unpin(one, 2);
+        unpin(two, 2);
+        drop_views(&[one, two]);
+    }
+
+    /// A pin that ended is let go by the next check, whichever path it
+    /// takes: the block is guarded again and reported once, then clean.
+    #[test]
+    fn an_ended_pin_is_let_go_and_its_block_guarded_again() {
+        let view = one_view(3);
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 0, 3)));
+        writing(view + BLOCK, 8);
+        let at = view / BLOCK + 1;
+        {
+            let mut g = guards();
+            let now = std::time::Instant::now();
+            for pin in g.pins.iter_mut().filter(|p| p.0 <= at && at < p.1) {
+                pin.2 = Until::Time(now);
+            }
+        }
+        // Fast path (block 0 guarded): the pin is gone, the block guarded.
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+        assert!(!guards().pinned(at));
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(Vec::new()));
+        assert!(!kernel_reads_into(view + BLOCK, b"late"), "guarded again once the pin ended");
+        drop_view(view, 3);
+    }
+
+    /// Whether any pin holds a block of `[view, view + blocks)`.
+    fn pinned_in(view: usize, blocks: usize) -> bool {
+        let g = guards();
+        (view / BLOCK..view / BLOCK + blocks).any(|b| g.pinned(b))
+    }
+
+    /// A write that ends with its caller pins its blocks while it runs
+    /// (reported, writable, in a range checked by the fast path) and lets
+    /// go when it is dropped: the next check guards them again and reports
+    /// them once.
+    #[test]
+    fn a_held_pin_lasts_as_long_as_its_write() {
+        let view = one_view(3);
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 0, 3)));
+        {
+            let _pinned = writing_held(view + BLOCK + 100, 13);
+            assert!(pinned_in(view, 3));
+            assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+            assert!(kernel_reads_into(view + BLOCK + 100, b"from the disk"));
+            assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+        }
+        assert!(!pinned_in(view, 3), "no pin outlives its write");
+        // Guarded again, and reported once more: the write may have landed
+        // after the last check.
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(Vec::new()));
+        assert!(!kernel_reads_into(view + BLOCK + 100, b"late"), "guarded again");
+        // SAFETY: the bytes the kernel put in.
+        assert_eq!(unsafe { std::slice::from_raw_parts((view + BLOCK + 100) as *const u8, 13) }, b"from the disk");
+        drop_view(view, 3);
+    }
+
+    /// A held pin is let go when its write ends early, by a return or a
+    /// panic.
+    #[test]
+    fn a_held_pin_is_let_go_when_its_write_ends_early() {
+        let view = one_view(2);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 2)));
+        let early = |fail: bool| -> Option<()> {
+            let _pinned = writing_held(view + 8, 8);
+            if fail {
+                return None;
+            }
+            Some(())
+        };
+        assert_eq!(early(true), None);
+        assert!(!pinned_in(view, 2));
+        let panicked = std::panic::catch_unwind(|| {
+            let _pinned = writing_held(view + BLOCK, 8);
+            panic!("a failed write");
+        });
+        assert!(panicked.is_err());
+        assert!(!pinned_in(view, 2));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 2)));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        drop_view(view, 2);
+    }
+
+    /// An asynchronous read keeps its blocks pinned after the call that
+    /// began it returned, until its `OVERLAPPED` says it completed.
+    #[test]
+    fn an_asynchronous_read_is_pinned_until_it_completed() {
+        let view = one_view(3);
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 0, 3)));
+        // Internal, InternalHigh, offsets, event.
+        let overlapped = Box::new(std::sync::atomic::AtomicUsize::new(STATUS_PENDING));
+        writing_held(view + BLOCK, 64).until_done(std::ptr::from_ref(&*overlapped).cast());
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+        assert!(pinned_in(view, 3), "still in flight");
+        assert!(kernel_reads_into(view + BLOCK, b"lands later"), "writable while in flight");
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+        // Completed: the next check lets go, guards and reports it.
+        overlapped.store(0, std::sync::atomic::Ordering::Release);
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(pages_of(view, 1, 2)));
+        assert!(!pinned_in(view, 3));
+        assert_eq!(guard(view, view + 3 * BLOCK), Some(Vec::new()));
+        assert!(!kernel_reads_into(view + BLOCK, b"late"), "guarded again");
+        drop_view(view, 3);
+    }
+
+    /// An `OVERLAPPED` whose memory is let go reads as completed: the title
+    /// frees it only once its read completed.
+    #[test]
+    fn an_asynchronous_read_whose_overlapped_is_gone_is_done() {
+        let view = one_view(2);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 2)));
+        // SAFETY: a page of our own, released below.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(page, 0);
+        // SAFETY: the page just committed.
+        unsafe { (page as *mut usize).write(STATUS_PENDING) };
+        writing_held(view + 8, 8).until_done(page as *const _);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 1)));
+        assert!(pinned_in(view, 2));
+        // SAFETY: our page.
+        unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 1)));
+        assert!(!pinned_in(view, 2));
+        drop_view(view, 2);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

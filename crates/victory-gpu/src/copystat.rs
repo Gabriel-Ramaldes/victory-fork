@@ -37,8 +37,18 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Pins of writes that end with their caller (`watch::writing_held`),
+    /// and the microseconds they held.
+    PinsHeld,
+    PinHeldUs,
+    /// Pins for a time (`watch::writing`: windows of the host GPU).
+    PinsTimed,
+    /// Held pins handed to an asynchronous read, and those let go once it
+    /// completed.
+    PinsAsync,
+    PinsAsyncDone,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 27;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +136,18 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    let held = c[C::PinsHeld as usize];
+    tracing::info!(
+        "pins per frame: {:.0} held for {:.1} us each ({:.2} ms in all); {:.1} for a time; {:.2} \
+         asynchronous, {:.2} of them let go once done; {} holding now",
+        held,
+        if held > 0.0 { c[C::PinHeldUs as usize] / held } else { 0.0 },
+        ms(c[C::PinHeldUs as usize]),
+        c[C::PinsTimed as usize],
+        c[C::PinsAsync as usize],
+        c[C::PinsAsyncDone as usize],
+        crate::watch::pins_alive(),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

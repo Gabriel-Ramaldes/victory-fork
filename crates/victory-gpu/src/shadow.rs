@@ -344,9 +344,7 @@ impl Shadow {
                     merge_gpu_writes_card(title_slice, staging_old, gpu_new);
                 if let Some((dirty_start, dirty_end)) = dirty_span {
                     let dirty_len = dirty_end - dirty_start;
-                    if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
-                    }
+                    let _pinned = (mode != 1).then(|| crate::watch::writing_held(title_addr + dirty_start, dirty_len));
                     crate::host::write_mapped(
                         (title_addr + dirty_start) as *mut u8,
                         title_slice[dirty_start..].as_ptr(),
@@ -638,9 +636,8 @@ impl Shadow {
                             merge_gpu_writes(title_slice, host, old)
                         {
                             let dirty_len = dirty_end - dirty_start;
-                            if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
-                            }
+                            let _pinned =
+                                (mode != 1).then(|| crate::watch::writing_held(start + at + dirty_start, dirty_len));
                             crate::host::write_mapped(
                                 (start + at + dirty_start) as *mut u8,
                                 title_slice[dirty_start..].as_ptr(),
@@ -1201,12 +1198,16 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let page = PAGE as u64;
     let window = run_of(address & !(page - 1), end.next_multiple_of(page)).and_then(|(start, stop)| {
-        // Read-only guards would refuse the GPU's writes.
-        crate::watch::writing(start as usize, (stop - start) as usize);
+        // Read-only guards would refuse the heap: open while it is made.
+        // (Pinned for two seconds before 2026-11-26, which the checks of
+        // ranges beginning with a guarded block did not see: they guarded
+        // the memory again at once, and windows worked so.)
+        let pinned = crate::watch::writing_held(start as usize, (stop - start) as usize);
         // SAFETY: committed memory; the heap keeps its pages.
         let heap: Result<ID3D12Heap, _> = unsafe {
             device.OpenExistingHeapFromAddress1(start as *const _, (stop - start) as usize)
         };
+        drop(pinned);
         match heap {
             Ok(heap) => placed(&heap, 0, start, stop - start),
             Err(error) => {
@@ -1324,10 +1325,12 @@ fn through_another_view(
         );
         return None;
     }
-    // Read-only guards would refuse the GPU's writes.
-    crate::watch::writing(start, len);
+    // Read-only guards would refuse the heap: open while it is made (as
+    // above).
+    let pinned = crate::watch::writing_held(start, len);
     // SAFETY: committed pages of our view; the heap keeps them.
     let heap: Result<ID3D12Heap, _> = unsafe { device.OpenExistingHeapFromAddress1(view.Value, len) };
+    drop(pinned);
     let window = match heap {
         Ok(heap) => placed(&heap, 0, start as u64, len as u64),
         Err(error) => {
@@ -2234,7 +2237,7 @@ impl Shadow {
                 merge_gpu_writes_mut(&mut buf[..n], host, old)
             {
                 let dirty_len = dirty_end - dirty_start;
-                crate::watch::writing(at + dirty_start, dirty_len);
+                let _pinned = crate::watch::writing_held(at + dirty_start, dirty_len);
                 crate::host::write_mapped(
                     (at + dirty_start) as *mut u8,
                     buf[dirty_start..].as_ptr(),
