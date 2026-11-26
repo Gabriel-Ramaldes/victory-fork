@@ -1646,6 +1646,156 @@ mod tests {
         drop_view(view, 2);
     }
 
+    /// Kernel calls for a read that stays in flight until we write the
+    /// other end of a pipe (declared here: the crate's bindings have no
+    /// pipes or files).
+    mod pipe {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            pub fn CreateNamedPipeW(
+                name: *const u16,
+                open: u32,
+                mode: u32,
+                instances: u32,
+                out: u32,
+                inb: u32,
+                timeout: u32,
+                security: *const c_void,
+            ) -> isize;
+            pub fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *const c_void,
+                disposition: u32,
+                flags: u32,
+                template: isize,
+            ) -> isize;
+            pub fn ReadFile(file: isize, buffer: *mut u8, len: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
+            pub fn WriteFile(file: isize, buffer: *const u8, len: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+            pub fn GetOverlappedResult(file: isize, overlapped: *mut c_void, done: *mut u32, wait: i32) -> i32;
+            pub fn CloseHandle(handle: isize) -> i32;
+            pub fn GetLastError() -> u32;
+        }
+        pub const PIPE_ACCESS_INBOUND: u32 = 1;
+        pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+        pub const GENERIC_WRITE: u32 = 0x4000_0000;
+        pub const OPEN_EXISTING: u32 = 3;
+        pub const ERROR_IO_PENDING: u32 = 997;
+
+        /// A pipe whose reading end reads asynchronously, and its writing end.
+        pub fn open(tag: &str) -> (isize, isize) {
+            let name: Vec<u16> = format!(r"\\.\pipe\victory-pin-{}-{tag}", std::process::id())
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            // SAFETY: a NUL-terminated name; handles checked below.
+            unsafe {
+                let read = CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                    0,
+                    1,
+                    0,
+                    4096,
+                    0,
+                    std::ptr::null(),
+                );
+                assert!(read != -1);
+                let write = CreateFileW(name.as_ptr(), GENERIC_WRITE, 0, std::ptr::null(), OPEN_EXISTING, 0, 0);
+                assert!(write != -1);
+                (read, write)
+            }
+        }
+    }
+
+    /// The runtime's `ReadFile` on a read that goes on asynchronously: a
+    /// pin until the `OVERLAPPED` completed. The kernel's write lands in a
+    /// guarded view after the call returned and after checks of its range
+    /// (by the fast path), the bytes are there, and the block is guarded
+    /// again and reported once the read completed.
+    #[test]
+    fn a_pending_kernel_read_lands_in_a_guarded_view() {
+        let view = one_view(2);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 2)));
+        let (read, write) = pipe::open("lands");
+        let at = view + BLOCK + 100;
+        // Internal, InternalHigh, Offset and OffsetHigh, hEvent.
+        let mut overlapped = Box::new([0usize; 4]);
+        let ov = overlapped.as_mut_ptr().cast::<std::ffi::c_void>();
+        // As files::ReadFile does it.
+        let pinned = writing_held(at, 13);
+        // SAFETY: 13 bytes of our view; the OVERLAPPED lives to the end.
+        let done = unsafe { pipe::ReadFile(read, at as *mut u8, 13, std::ptr::null_mut(), ov) };
+        // SAFETY: plain query.
+        let error = unsafe { pipe::GetLastError() };
+        assert!(done == 0 && error == pipe::ERROR_IO_PENDING, "in flight: {done} {error}");
+        pinned.until_done(ov);
+        // Checks while it is in flight: writable, reported each time.
+        for _ in 0..3 {
+            assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 1, 2)));
+            assert!(pinned_in(view, 2), "pinned while in flight");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The other end writes: the kernel completes the read into the view.
+        let mut n = 0;
+        // SAFETY: 13 bytes of a literal.
+        assert!(unsafe { pipe::WriteFile(write, b"from the pipe".as_ptr(), 13, &mut n, std::ptr::null_mut()) } != 0);
+        // SAFETY: the read's OVERLAPPED; waits for its completion.
+        let completed = unsafe { pipe::GetOverlappedResult(read, ov, &mut n, 1) };
+        assert!(completed != 0 && n == 13, "the read completed: {completed} {n}");
+        // SAFETY: the bytes the kernel put in.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 13) }, b"from the pipe");
+        // The next check lets go of the pin, guards the block and reports it.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 1, 2)));
+        assert!(!pinned_in(view, 2));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        assert!(!kernel_reads_into(at, b"late"), "guarded again");
+        // SAFETY: our handles.
+        unsafe {
+            pipe::CloseHandle(write);
+            pipe::CloseHandle(read);
+        }
+        drop(overlapped);
+        drop_view(view, 2);
+    }
+
+    /// Without the pin, the same pending read fails when it completes into
+    /// a block guarded meanwhile: what the pin is for.
+    #[test]
+    fn a_pending_kernel_read_fails_into_a_block_guarded_meanwhile() {
+        let view = one_view(2);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 0, 2)));
+        let (read, write) = pipe::open("fails");
+        let at = view + BLOCK + 100;
+        let mut overlapped = Box::new([0usize; 4]);
+        let ov = overlapped.as_mut_ptr().cast::<std::ffi::c_void>();
+        // Opened for the call only, as a pin held by the call would.
+        {
+            let _pinned = writing_held(at, 13);
+            // SAFETY: as above.
+            let done = unsafe { pipe::ReadFile(read, at as *mut u8, 13, std::ptr::null_mut(), ov) };
+            // SAFETY: plain query.
+            assert!(done == 0 && unsafe { pipe::GetLastError() } == pipe::ERROR_IO_PENDING);
+        }
+        // A check guards the block again while the read is in flight.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(pages_of(view, 1, 2)));
+        let mut n = 0;
+        // SAFETY: as above.
+        assert!(unsafe { pipe::WriteFile(write, b"from the pipe".as_ptr(), 13, &mut n, std::ptr::null_mut()) } != 0);
+        // SAFETY: as above.
+        let completed = unsafe { pipe::GetOverlappedResult(read, ov, &mut n, 1) };
+        assert_eq!(completed, 0, "the kernel could not write a guarded block");
+        // SAFETY: our handles.
+        unsafe {
+            pipe::CloseHandle(write);
+            pipe::CloseHandle(read);
+        }
+        drop(overlapped);
+        drop_view(view, 2);
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]

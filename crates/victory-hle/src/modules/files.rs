@@ -751,6 +751,67 @@ mod tests {
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
+    /// A read that goes on asynchronously: `ReadFile` says so with the
+    /// error the host gave (`ERROR_IO_PENDING`), and the read completes into
+    /// the buffer later.
+    #[test]
+    fn an_asynchronous_read_keeps_its_error_and_completes() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateNamedPipeW(
+                name: *const u16,
+                open: u32,
+                mode: u32,
+                instances: u32,
+                out: u32,
+                inb: u32,
+                timeout: u32,
+                security: *const c_void,
+            ) -> isize;
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *const c_void,
+                disposition: u32,
+                flags: u32,
+                template: isize,
+            ) -> isize;
+            fn WriteFile(file: isize, buffer: *const u8, len: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+            fn GetOverlappedResult(file: isize, overlapped: *mut c_void, done: *mut u32, wait: i32) -> i32;
+            fn CloseHandle(handle: isize) -> i32;
+            fn GetLastError() -> u32;
+        }
+        let name = w(&format!(r"\\.\pipe\victory-hle-read-{}", std::process::id()));
+        // Inbound, read with FILE_FLAG_OVERLAPPED; the other end writes.
+        // SAFETY: a NUL-terminated name; handles checked.
+        let (read, write) = unsafe {
+            let read = CreateNamedPipeW(name.as_ptr(), 1 | 0x4000_0000, 0, 1, 0, 4096, 0, std::ptr::null());
+            assert!(read != -1);
+            let write = CreateFileW(name.as_ptr(), 0x4000_0000, 0, std::ptr::null(), 3, 0, 0);
+            assert!(write != -1);
+            (read, write)
+        };
+        let mut out = [0u8; 8];
+        let mut overlapped = [0usize; 4];
+        let ov = overlapped.as_mut_ptr().cast::<c_void>();
+        let done = ReadFile(read as *mut c_void, out.as_mut_ptr(), 8, std::ptr::null_mut(), ov);
+        // SAFETY: plain query, right after the call.
+        assert_eq!((done, unsafe { GetLastError() }), (0, 997), "pending, with its error");
+        let mut n = 0;
+        // SAFETY: 8 bytes of a literal; then the read's OVERLAPPED.
+        unsafe {
+            assert!(WriteFile(write, b"7 bytes!".as_ptr(), 8, &mut n, std::ptr::null_mut()) != 0);
+            assert!(GetOverlappedResult(read, ov, &mut n, 1) != 0);
+        }
+        assert_eq!((&out, n), (b"7 bytes!", 8));
+        // SAFETY: our handles.
+        unsafe {
+            CloseHandle(write);
+            CloseHandle(read);
+        }
+    }
+
     fn text(v: &[u16]) -> String {
         String::from_utf16_lossy(&v[..v.len() - 1])
     }

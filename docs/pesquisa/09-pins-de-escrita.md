@@ -60,3 +60,31 @@ Build diag, `data-gf`, async e STRETCH ligados, quadros com ≥ 4500 draws:
 - **Quadro:** a diferença fica dentro do ruído.
 - **Guard faults:** sobem, porque os blocos voltam a ser protegidos logo depois da escrita.
 - **Estabilidade:** nenhuma queda nem perda de device. A imagem não foi comparada.
+
+## Verificações (mesmo dia, depois do commit `283665df`)
+
+**Integridade:**
+- Dois testes do `watch` usam uma leitura assíncrona real: um pipe com `FILE_FLAG_OVERLAPPED`, cuja leitura fica pendente até o outro lado escrever. O teste segue a mesma sequência do `ReadFile` do HLE.
+- **Com o pin:** o bloco passa por três checagens pelo caminho rápido sem perder o pin, os bytes do kernel chegam certos e o bloco volta a ser protegido depois da conclusão.
+- **Sem o pin:** a mesma leitura falha ao concluir.
+- Os dois testes passaram 30 vezes em 30.
+- Um teste do HLE confirma que o `ReadFile` devolve `ERROR_IO_PENDING` intacto e que a leitura conclui.
+- **No jogo:** não houve nenhuma leitura assíncrona nesta cena.
+
+**Repetibilidade:** três pares intercalados, A = `07fddf73` e B = `283665df`, build diag, `data-gf`, ≥ 4500 draws, médias:
+
+| | A | B |
+|---|---|---|
+| quadro | 227,9 ms | 217,3 ms (B menor nos 3 pares) |
+| preparo | 108,5 ms | 102,6 ms |
+| copies | 43,4 ms | 37,8 ms (B menor em 2 de 3 pares) |
+| refreshes | 78 mil | 69 mil |
+| guard faults | 649 | 797 |
+| mundo | 112 s | 98 s |
+
+**Imagem:**
+- Capturas a cada 150 quadros do mundo, comparadas no mesmo momento da cena.
+- A diferença entre builds diferentes (média 1,7 e 3,0) ficou igual ou menor que entre duas rodadas do mesmo build (4,9).
+- A olho, nenhuma diferença.
+
+**Estabilidade:** nenhuma queda ou perda de device nas seis rodadas.
