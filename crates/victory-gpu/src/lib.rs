@@ -51,6 +51,7 @@ mod memory;
 mod timeline;
 pub mod memstat;
 pub mod object;
+mod parallel;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;

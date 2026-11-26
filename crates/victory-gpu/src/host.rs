@@ -3000,7 +3000,7 @@ impl Early {
 
 /// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
-    const THREADS: usize = 6;
+    const THREADS: usize = crate::parallel::HELPERS + 1;
     if list.len() <= least {
         return f(list);
     }
@@ -3017,12 +3017,9 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
         }
     };
     let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
-        }
-        work();
-    });
+    // On kept threads (`parallel`): starting them on every call cost
+    // hundreds of microseconds of the submitting thread.
+    crate::parallel::run(threads - 1, &work);
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
