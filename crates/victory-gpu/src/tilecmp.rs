@@ -48,6 +48,31 @@ pub(crate) fn workers() -> usize {
     })
 }
 
+/// `VICTORY_BACK_COMPARE_CHECK=1`: `sparse_back` compares every tile again
+/// at its turn, uses that answer, and counts where the workers' differed
+/// ([`checked`]); a test of the experiment, slower than either.
+pub(crate) fn check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = workers() > 0 && std::env::var("VICTORY_BACK_COMPARE_CHECK").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::warn!("VICTORY_BACK_COMPARE_CHECK=1: every tile compared again at its turn");
+        }
+        on
+    })
+}
+
+/// A tile compared again ([`check`]): whether the two answers disagreed.
+pub(crate) fn checked(disagreed: bool) {
+    CHECKS[0].fetch_add(1, Ordering::Relaxed);
+    if disagreed {
+        CHECKS[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Tiles compared again since the start, and disagreements.
+static CHECKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 fn asked(v: Option<&str>) -> usize {
     v.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0).min(8)
 }
@@ -235,7 +260,7 @@ pub(crate) fn text() -> String {
     let n: [u64; 7] = STATS.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
     format!(
         "copy-back compare on {} workers, per frame: {:.0} calls on them ({:.1} ms, of it {:.1} ms waiting for theirs), \
-         {:.0} on their own thread; pieces by callers {:.0}, by workers {:.0}; panicked {}",
+         {:.0} on their own thread; pieces by callers {:.0}, by workers {:.0}; panicked {}{}",
         workers(),
         n[POOLED] as f64 / frames,
         n[CALL_NS] as f64 / 1e6 / frames,
@@ -244,6 +269,15 @@ pub(crate) fn text() -> String {
         n[BY_CALLER] as f64 / frames,
         n[BY_WORKERS] as f64 / frames,
         n[PANICKED],
+        if check() {
+            format!(
+                "; checked so far {} tiles, disagreed {}",
+                CHECKS[0].load(Ordering::Relaxed),
+                CHECKS[1].load(Ordering::Relaxed)
+            )
+        } else {
+            String::new()
+        },
     )
 }
 

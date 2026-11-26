@@ -2047,6 +2047,16 @@ impl Shadow {
             let t0 = tally.tile_start();
             #[cfg(feature = "diagnostics")]
             let same = match wide.as_mut() {
+                // `VICTORY_BACK_COMPARE_CHECK=1`: compared here too, this
+                // answer used, and disagreements counted.
+                Some(found) if crate::tilecmp::check() => {
+                    let here = host == old;
+                    // Disagreeing: the workers found a difference where
+                    // there is none, or none where there is one, or had no
+                    // answer for this tile.
+                    crate::tilecmp::checked(found.next().map_or(true, |differs| differs == here));
+                    here
+                }
                 Some(found) => found.next().map_or_else(|| host == old, |differs| !differs),
                 None => host == old,
             };
