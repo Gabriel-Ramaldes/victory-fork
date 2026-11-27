@@ -1114,6 +1114,18 @@ impl Shadow {
             return;
         }
         let at = usize::from(origin.min(6)) * 4;
+        // Inside a live window on title memory in place (STRETCH)?
+        let in_window = {
+            let windows = windows_of_memory();
+            windows.range(..=a as u64).next_back().is_some_and(|(_, w)| {
+                w.start as usize <= a
+                    && b <= (w.start + w.len) as usize
+                    && w.direct.as_ref().is_some_and(|d| !d.dead.load(Ordering::Acquire))
+            })
+        };
+        if in_window {
+            ORIGIN_IN_WINDOW[usize::from(origin.min(6))].fetch_add((b - a) as u64, Relaxed);
+        }
         ORIGIN_COPIES[at].fetch_add(1, Relaxed);
         ORIGIN_COPIES[at + 1].fetch_add((b - a) as u64, Relaxed);
         if same {
@@ -1406,6 +1418,58 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// Runs of views shorter than this are copied: each window is a host heap.
 const STRETCH_LEAST: u64 = 4 << 20;
 
+/// [`STRETCH_LEAST`]; diagnostics builds: `VICTORY_STRETCH_LEAST_KB=<n>`
+/// (64 at least) for measuring smaller windows (docs/pesquisa/12).
+fn stretch_least() -> u64 {
+    #[cfg(feature = "diagnostics")]
+    {
+        static LEAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *LEAST.get_or_init(|| {
+            let least = std::env::var("VICTORY_STRETCH_LEAST_KB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(STRETCH_LEAST, |kb| (kb.max(64) << 10).next_multiple_of(PAGE as u64));
+            if least != STRETCH_LEAST {
+                tracing::warn!(kib = least >> 10, "runs of title views used in place from this size (VICTORY_STRETCH_LEAST_KB)");
+            }
+            least
+        })
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    STRETCH_LEAST
+}
+
+/// Diagnostics (`VICTORY_COPY_COUNTS=1`): windows through views of ours
+/// made since the last line, their bytes, microseconds opening their heaps;
+/// runs of views turned down as shorter than [`stretch_least`], and bytes.
+#[cfg(feature = "diagnostics")]
+static STRETCHED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Diagnostics: [`STRETCHED`] since the last call, and the windows alive
+/// and dead, as a line; `None` without `VICTORY_COPY_COUNTS=1`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stretch_text() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::backread::counts() {
+        return None;
+    }
+    let c: Vec<u64> = STRETCHED.iter().map(|a| a.swap(0, Relaxed)).collect();
+    let (alive, bytes) = {
+        let map = windows_of_memory();
+        (map.len(), map.values().map(|w| w.len).sum::<u64>())
+    };
+    Some(format!(
+        "windows through views of ours since: {} made, {:.1} MB, {:.2} ms opening heaps; {} runs too short, {:.1} MB;          windows alive {alive} ({:.0} MB), dead so far {}",
+        c[0],
+        c[1] as f64 / 1e6,
+        c[2] as f64 / 1e3,
+        c[3],
+        c[4] as f64 / 1e6,
+        bytes as f64 / 1e6,
+        DEAD_WINDOWS.load(Relaxed)
+    ))
+}
+
 /// Whether runs of views are used in place (`VICTORY_STRETCH=0` copies
 /// them, as before).
 fn stretch_on() -> bool {
@@ -1447,7 +1511,12 @@ fn through_another_view(
     let (start, stop, section, offset) =
         crate::watch::run_of_views(address as usize, end as usize, low as usize, high as usize)?;
     let len = stop - start;
-    if (len as u64) < STRETCH_LEAST {
+    if (len as u64) < stretch_least() {
+        #[cfg(feature = "diagnostics")]
+        {
+            STRETCHED[3].fetch_add(1, Ordering::Relaxed);
+            STRETCHED[4].fetch_add(len as u64, Ordering::Relaxed);
+        }
         return None;
     }
     // SAFETY: a section the runtime reported with live views of it; the
@@ -1465,8 +1534,12 @@ fn through_another_view(
     // Read-only guards would refuse the heap: open while it is made (as
     // above).
     let pinned = crate::watch::writing_held(start, len);
+    #[cfg(feature = "diagnostics")]
+    let opening = std::time::Instant::now();
     // SAFETY: committed pages of our view; the heap keeps them.
     let heap: Result<ID3D12Heap, _> = unsafe { device.OpenExistingHeapFromAddress1(view.Value, len) };
+    #[cfg(feature = "diagnostics")]
+    STRETCHED[2].fetch_add(opening.elapsed().as_micros() as u64, Ordering::Relaxed);
     drop(pinned);
     let window = match heap {
         Ok(heap) => placed(&heap, 0, start as u64, len as u64),
@@ -1487,6 +1560,11 @@ fn through_another_view(
     static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let bytes = BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+    #[cfg(feature = "diagnostics")]
+    {
+        STRETCHED[0].fetch_add(1, Ordering::Relaxed);
+        STRETCHED[1].fetch_add(len as u64, Ordering::Relaxed);
+    }
     if count <= 32 || count.is_power_of_two() {
         tracing::info!(
             count,
@@ -2169,6 +2247,11 @@ thread_local! {
 /// Per origin of the page's last write note (0 never copied, then
 /// `watch::ORIGIN_*`; 6: a part of an edge page left as it was, not
 /// copied): pages copied, bytes, of them pages that changed nothing, bytes.
+/// Of [`ORIGIN_COPIES`]' bytes, by origin: those inside a live window on
+/// title memory in place.
+#[cfg(feature = "diagnostics")]
+static ORIGIN_IN_WINDOW: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
 #[cfg(feature = "diagnostics")]
 static ORIGIN_COPIES: [std::sync::atomic::AtomicU64; 28] = [const { std::sync::atomic::AtomicU64::new(0) }; 28];
 
@@ -2374,11 +2457,12 @@ pub(crate) fn refresh_paths_text(frames: f64) -> Option<String> {
     {
         let _ = write!(
             line,
-            " {name} {:.0} pages {:.1} MB ({:.0} pages {:.1} MB changed nothing);",
+            " {name} {:.0} pages {:.1} MB ({:.0} pages {:.1} MB changed nothing; {:.1} MB inside a live window);",
             o[i * 4],
             o[i * 4 + 1] / 1e6,
             o[i * 4 + 2],
-            o[i * 4 + 3] / 1e6
+            o[i * 4 + 3] / 1e6,
+            ORIGIN_IN_WINDOW[i].swap(0, Relaxed) as f64 / frames / 1e6
         );
     }
     let a: Vec<f64> = ALL_DIFFERS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
