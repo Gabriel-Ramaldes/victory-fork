@@ -1,6 +1,6 @@
 # VIctory fork for AMD Radeon (work in progress)
 
-## This branch: `dev-belobug` (Gabriel-Ramaldes/victory-fork)
+## This branch: `dev-belobug` (Gabriel-Ramaldes/victory-fork, default branch)
 
 A compatibility-research branch: the user's own Xbox Series dump, run on
 Windows through VIctory, measured on the machine below. Since 2026-11-25 it
@@ -52,6 +52,66 @@ On this branch, over Belobug's `71652a2`:
 - 2026-11-25 `1a5781e`: `VICTORY_CAPTURE_WORLD=<n>` saves the world's frames
   counted from its first frame of 500 draws or more (the world started at
   frame ~22,000 in one run and ~47,800 in another).
+- 2026-11-25 `ca9460c`: release builds use thin link-time optimization
+  and one codegen unit; `390adf2`, `8eb7180`: a corner box on every frame
+  with frame time, processor and GPU share, memory and draws.
+- 2026-11-25 `2d4a12f`: the title's FidelityFX upscaler calls served by
+  AMD's PC upscaler (`VICTORY_FFX_DIR`); `c67adf3`: textures the title reads
+  on the CPU (the ocean's height maps) copied back from the GPU, so boats
+  float.
+
+### Performance work on this branch (2026-11-25/26)
+
+The goal is a specialization of Belobug's tree for the RX 9070 XT and Zen 2
+processors (Ryzen 3000). On the 3700X the frame is bound by the processor:
+the GPU works ~71 ms of a ~210-230 ms frame (measured with
+`VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=light`, which make
+submissions synchronous: a diagnostic, never a benchmark). Each change below
+was measured on its own, in its own scene, against the commit before it.
+The gains do not simply add up, and runs vary by about 10-15%. Methods and
+raw numbers are in [`docs/pesquisa`](docs/pesquisa) (pt-BR).
+
+| Commit | Change | Measured | Frame |
+|--------|--------|----------|-------|
+| `bc85525` | STRETCH: runs of the title's 64 KiB views used in place through a view of ours, instead of copied (doc 06) | copies 190 → 126 MB, copy-back 79 → 29 ms | 350 → 258 ms (release; ~9% fewer draws in the STRETCH runs) |
+| `19656a0` | `VICTORY_ASYNC_SUBMIT=1`: the title's submissions return before the GPU is done (doc 07) | waiting on the GPU −62 ms | 226 → 203 ms, 4.4 → 4.9 fps (release) |
+| `e09a57e` | bindless plans look for slots on dead windows only after a window died (doc 08) | bindless plans 36 → 25 ms, preparing −24 ms | within noise |
+| `283665d` | write pins held only as long as their write, honored on every check (doc 09) | copies 43 → 38 ms | 228 → 217 ms, lower in 3 of 3 pairs |
+| `2be674c` | `in_parallel` on kept helper threads instead of new ones per call (doc 10) | 298 → 1.3 µs per call, copies −3 ms | within noise |
+| `3124244` | `wait_fence` waits for the card outside the `submitted` lock (doc 11) | — | 241 → 228 ms, lower in 3 of 3 pairs |
+| `7c51326` | pages copied in part are copied again only when written (doc 11) | copies −6 ms, refresh copies ~600 → ~430 MB/frame | not shown yet (A/B pending) |
+
+What was learned, and what did not work:
+
+- **The processor's work is the frame.** About 120-130 ms of preparing per
+  frame: copies of title memory, bindless plans, copy-back of what the GPU
+  wrote. The GPU is still on the critical path through the waits between
+  submissions.
+- **Most copies change nothing.** With `VICTORY_COPY_DIFFERS=1`, ~83% of the
+  refresh copies are byte-identical. The largest source (~200-280 MB a
+  frame) is the echo of GPU writes: a STRETCH window's copy-back marks its
+  whole declared range written, and every view of the same physical pages
+  is then copied again.
+- **Smaller STRETCH windows do not remove that echo** (doc 12,
+  `0a98bf8`, diagnostic switch `VICTORY_STRETCH_LEAST_KB`). At 64 KiB there
+  were 4,303 windows and no run refused, yet the echo stayed the same and
+  commit grew by 1 GB. The echo lies in existing sparse copies of the
+  aliases. The next lead is marking only the pages the GPU wrote.
+- **Did not improve the frame:**
+  - card buffers (sparse copies pre-empt them);
+  - write-watch bitmaps;
+  - comparing copy-back tiles on two threads (bit-identical, ~1 ms);
+  - finer clean epochs (simulated);
+  - tiles in place (Belobug measured that they remove the device; not
+    tried).
+- **Not used:**
+  - the relay (device losses on AMD);
+  - `VICTORY_SPARSE=0` as a game setting.
+- **Measuring:** A/Bs run on a fixed manual save, restored before each run,
+  in interleaved pairs. Even then the camera can start elsewhere, so the
+  draw count is checked before comparing. Diagnostic counters
+  (`VICTORY_COPY_COUNTS=1` and others) slow the frame, so their runs are
+  never benchmarks.
 
 On the previous line, `dev-fxceless` (fxceless/victory-fork with ports), by
 date; authors as in the history:
